@@ -72,16 +72,6 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
-// Diagnostic: re-run phase 1 (D2H) and/or phase 3 (H2D) N times within the
-// kernel so per-phase bandwidth can be backed out from the timing.  Both
-// default to 1; bump for an experiment, then revert.
-#ifndef GGML_CUDA_AR_PHASE1_LOOPS
-#define GGML_CUDA_AR_PHASE1_LOOPS 1
-#endif
-#ifndef GGML_CUDA_AR_PHASE3_LOOPS
-#define GGML_CUDA_AR_PHASE3_LOOPS 1
-#endif
-
 // ---------------------------------------------------------------------------
 // Chunked-kernel AllReduce — 2 GPUs, supports float, half, and bfloat16.
 //
@@ -137,8 +127,7 @@ static __global__ void ggml_cuda_ar_kernel(
     const int tail      = count_vec * ELEMS_PER_VEC;
 
     // Phase 1: cast sendbuf (Tdst) -> host_mine (Twire) and store as 16-byte vectors.
-    #pragma unroll
-    for (int rep = 0; rep < GGML_CUDA_AR_PHASE1_LOOPS; ++rep) {
+    {
         for (int i = gtid; i < count_vec; i += gnt) {
             const int off = i * ELEMS_PER_VEC;
             Twire wire[ELEMS_PER_VEC];
@@ -183,8 +172,7 @@ static __global__ void ggml_cuda_ar_kernel(
 
     // Phase 3: read peer's Twire vector, cast both sides through Twire for
     // bit-equivalence, sum in Tdst precision, and write back to recvbuf.
-    #pragma unroll
-    for (int rep = 0; rep < GGML_CUDA_AR_PHASE3_LOOPS; ++rep) {
+    {
         for (int i = gtid; i < count_vec; i += gnt) {
             const int off = i * ELEMS_PER_VEC;
             Twire wire[ELEMS_PER_VEC];
