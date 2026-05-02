@@ -72,6 +72,16 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
+// Diagnostic: re-run phase 1 (D2H) and/or phase 3 (H2D) N times within the
+// kernel so per-phase bandwidth can be backed out from the timing.  Both
+// default to 1; bump for an experiment, then revert.
+#ifndef GGML_CUDA_AR_PHASE1_LOOPS
+#define GGML_CUDA_AR_PHASE1_LOOPS 1
+#endif
+#ifndef GGML_CUDA_AR_PHASE3_LOOPS
+#define GGML_CUDA_AR_PHASE3_LOOPS 1
+#endif
+
 // ---------------------------------------------------------------------------
 // Chunked-kernel AllReduce — 2 GPUs, supports float, half, and bfloat16.
 //
@@ -127,7 +137,8 @@ static __global__ void ggml_cuda_ar_kernel(
     const int tail      = count_vec * ELEMS_PER_VEC;
 
     // Phase 1: cast sendbuf (Tdst) -> host_mine (Twire) and store as 16-byte vectors.
-    {
+    #pragma unroll
+    for (int rep = 0; rep < GGML_CUDA_AR_PHASE1_LOOPS; ++rep) {
         for (int i = gtid; i < count_vec; i += gnt) {
             const int off = i * ELEMS_PER_VEC;
             Twire wire[ELEMS_PER_VEC];
@@ -157,7 +168,10 @@ static __global__ void ggml_cuda_ar_kernel(
         ggml_cuda_ar_signal_set(my_slot, token);
         __threadfence_system(); // make our signal visible system-wide
 
-        while (ggml_cuda_ar_signal_get(other_slot) != token) {
+        // Signed-difference comparison so a fast peer that has already passed
+        // our target (e.g. a future hybrid AR's per-chunk tokens) doesn't
+        // deadlock us.  Wraparound is handled correctly by signed math.
+        while ((int) (ggml_cuda_ar_signal_get(other_slot) - token) < 0) {
             __nanosleep(100);
         }
     }
@@ -169,7 +183,8 @@ static __global__ void ggml_cuda_ar_kernel(
 
     // Phase 3: read peer's Twire vector, cast both sides through Twire for
     // bit-equivalence, sum in Tdst precision, and write back to recvbuf.
-    {
+    #pragma unroll
+    for (int rep = 0; rep < GGML_CUDA_AR_PHASE3_LOOPS; ++rep) {
         for (int i = gtid; i < count_vec; i += gnt) {
             const int off = i * ELEMS_PER_VEC;
             Twire wire[ELEMS_PER_VEC];
@@ -185,6 +200,134 @@ static __global__ void ggml_cuda_ar_kernel(
             const Twire d_low = static_cast<Twire>(sendbuf[tail + tid]);
             recvbuf[tail + tid] =
                 static_cast<Tdst>(d_low) + static_cast<Tdst>(host_other[tail + tid]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid kernel — single launch, chunked D2H + chunked H2D, per-chunk sync.
+//
+// Structure (per GPU, n_chunks chunks per AR):
+//
+//   D2H[0]  fence  signal(tok+0)
+//   D2H[1]  fence  signal(tok+1)
+//   ...
+//   D2H[n-1] fence signal(tok+n-1)
+//   wait_peer(tok+0)   H2D[0]
+//   wait_peer(tok+1)   H2D[1]
+//   ...
+//   wait_peer(tok+n-1) H2D[n-1]
+//
+// Each H2D waits only for its own chunk to be ready on the peer rather than
+// for the peer's entire D2H phase to complete.  When the two GPUs drift
+// out of phase, this lets one GPU's H2D overlap with the other's still-in-
+// progress D2H (different PCIe directions on different links).  Buffer is
+// not reused across chunks — host_mine / host_other are sized to the full
+// AR (host_buf is enlarged for that), so peer can read chunk c at any time
+// after we've signalled.
+//
+// Spin uses signed-difference compare so a peer that has already advanced
+// past the target token does not deadlock us; this also handles 32-bit wrap.
+// Outer call_count advances by GGML_CUDA_AR_TOKEN_STRIDE so the inner
+// per-chunk tokens never overlap with adjacent ARs.
+// ---------------------------------------------------------------------------
+template <typename Tdst, typename Twire>
+static __global__ void ggml_cuda_ar_kernel_hybrid(
+        const Tdst  * __restrict__ sendbuf,
+        Tdst        * __restrict__ recvbuf,
+        Twire       * __restrict__ host_mine,
+        const Twire * __restrict__ host_other,
+        int                        count,
+        int                        chunk_max,
+        int                        n_chunks,
+        int *                      arrival_mine,
+        int *                      arrival_other,
+        int                        token) {
+
+    constexpr int ELEMS_PER_VEC = 16 / sizeof(Twire);
+    constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
+
+    const int tid  = threadIdx.x;
+    const int nt   = blockDim.x;
+    const int bid  = blockIdx.x;
+    const int gtid = bid * nt + tid;
+    const int gnt  = gridDim.x * nt;
+
+    int       * my_slot    = arrival_mine  + bid * ARRIVAL_INTS;
+    const int * other_slot = arrival_other + bid * ARRIVAL_INTS;
+
+    // Phase 1: chunked D2H.  After each chunk's writes, fence + signal the
+    // matching token so peer can begin reading that chunk.
+    for (int c = 0; c < n_chunks; ++c) {
+        const int chunk_offset = c * chunk_max;
+        const int chunk_count  = min(chunk_max, count - chunk_offset);
+        const int chunk_vec    = chunk_count / ELEMS_PER_VEC;
+        const bool is_last     = (c == n_chunks - 1);
+
+        for (int i = gtid; i < chunk_vec; i += gnt) {
+            const int off = chunk_offset + i * ELEMS_PER_VEC;
+            Twire wire[ELEMS_PER_VEC];
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                wire[k] = static_cast<Twire>(sendbuf[off + k]);
+            }
+            *reinterpret_cast<float4 *>(&host_mine[off]) =
+                *reinterpret_cast<const float4 *>(wire);
+        }
+        // Tail elements live in the last chunk only (count contiguous).
+        if (is_last && bid == 0) {
+            const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
+            const int leftover   = count - tail_start;
+            if (tid < leftover) {
+                host_mine[tail_start + tid] = static_cast<Twire>(sendbuf[tail_start + tid]);
+            }
+        }
+
+        __threadfence_system();
+        __syncthreads();
+
+        if (tid == 0) {
+            ggml_cuda_ar_signal_set(my_slot, token + c);
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+
+    // Phase 3: per-chunk pre-spin then H2D + reduce.
+    for (int c = 0; c < n_chunks; ++c) {
+        if (tid == 0) {
+            const int target = token + c;
+            while ((int) (ggml_cuda_ar_signal_get(other_slot) - target) < 0) {
+                __nanosleep(100);
+            }
+        }
+        __syncthreads();
+        __threadfence_system();   // acquire peer's writes for chunk c
+
+        const int chunk_offset = c * chunk_max;
+        const int chunk_count  = min(chunk_max, count - chunk_offset);
+        const int chunk_vec    = chunk_count / ELEMS_PER_VEC;
+        const bool is_last     = (c == n_chunks - 1);
+
+        for (int i = gtid; i < chunk_vec; i += gnt) {
+            const int off = chunk_offset + i * ELEMS_PER_VEC;
+            Twire wire[ELEMS_PER_VEC];
+            *reinterpret_cast<float4 *>(wire) =
+                *reinterpret_cast<const float4 *>(&host_other[off]);
+            #pragma unroll
+            for (int k = 0; k < ELEMS_PER_VEC; ++k) {
+                const Twire d_low = static_cast<Twire>(sendbuf[off + k]);
+                recvbuf[off + k] = static_cast<Tdst>(d_low) + static_cast<Tdst>(wire[k]);
+            }
+        }
+        if (is_last && bid == 0) {
+            const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
+            const int leftover   = count - tail_start;
+            if (tid < leftover) {
+                const Twire d_low = static_cast<Twire>(sendbuf[tail_start + tid]);
+                recvbuf[tail_start + tid] =
+                    static_cast<Tdst>(d_low) + static_cast<Tdst>(host_other[tail_start + tid]);
+            }
         }
     }
 }
@@ -220,17 +363,31 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // explicit before we overwrite host_buf[slot] for the new AR.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
-// Maximum chunk size (bytes per GPU) handled by one chunked-kernel launch.
-// Larger tensors are reduced by issuing multiple chunked launches.
-static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 1024 * 1024; // 1 MB
+// Maximum AR wire size (bytes per GPU) handled by the chunked-kernel /
+// hybrid-kernel path.  host_buf is sized to this per pool slot, so it must
+// also accommodate the full hybrid AR (which doesn't reuse buffer slots
+// across chunks within an AR — that's what enables cross-GPU phase overlap).
+static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
+
+// Hybrid kernel chunk size (BF16 wire bytes).  Smaller = finer-grain pipeline
+// across GPUs but more sync overhead per AR.  Compile-time so we can shmoo it.
+#ifndef GGML_CUDA_AR_HYBRID_CHUNK_BYTES
+#define GGML_CUDA_AR_HYBRID_CHUNK_BYTES (512 * 1024) // 512 KB
+#endif
+
+// Per-AR token stride.  Each AR reserves this many consecutive token values:
+// one per inner sync (post-D2H of each chunk) for the hybrid kernel.  256
+// leaves room for up to 256 chunks per AR — plenty for any chunk size we'd
+// realistically shmoo.
+static constexpr int GGML_CUDA_AR_TOKEN_STRIDE = 256;
 
 // Copy-engine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
-// AR wire size at which the copy-engine path takes over from the chunked-
-// kernel path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
-static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 1024 * 1024; // 1 MB
+// AR wire size at which the copy-engine path takes over from the kernel
+// path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
+static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 4 * 1024 * 1024; // 4 MB
 // Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
 // The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
 // the peer); the clamps cover the cases where nbytes/4 is too small (per-
@@ -359,7 +516,7 @@ static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * 
         }
     }
 
-    return { slot, (int) p->call_count };
+    return { slot, (int) (p->call_count * GGML_CUDA_AR_TOKEN_STRIDE) };
 }
 
 // Per-AR copy-engine chunk size: env-var override if set, else heuristic
@@ -766,12 +923,19 @@ bool ggml_cuda_ar_allreduce(
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // Decide between copy-engine and chunked-kernel paths based on the working
-    // type's actual byte count.  No upper bound: copy_outer slices reductions
-    // larger than copy_bytes into copy_bytes-sized pieces.
+    // Three-way path selection based on wire-byte size:
+    //   nbytes ≤ HYBRID_CHUNK_BYTES         → chunked-kernel (single launch, single chunk)
+    //   HYBRID_CHUNK_BYTES < nbytes < copy_threshold → hybrid kernel (single launch, n chunks
+    //                                          with per-chunk D2H/H2D pipeline sync)
+    //   nbytes ≥ copy_threshold             → copy-engine (separate cudaMemcpyAsync calls)
+    // No upper bound on copy-engine: copy_outer slices reductions larger than
+    // copy_bytes into copy_bytes-sized pieces.
     const bool use_copy_engine =
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
+    const bool use_hybrid =
+        !use_copy_engine &&
+        nbytes > GGML_CUDA_AR_HYBRID_CHUNK_BYTES;
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
     // (chunked-kernel path) and the combined add kernel (copy_engine path)
@@ -861,6 +1025,60 @@ bool ggml_cuda_ar_allreduce(
                 default:
                     GGML_ASSERT(false);
             }
+        }
+    } else if (use_hybrid) {
+        // Hybrid kernel: single launch, n_chunks per-chunk D2H+H2D with per-
+        // chunk token pipelining.  host_buf is sized to GGML_CUDA_AR_MAX_BYTES
+        // per pool slot (≥ nbytes here, since use_copy_engine guarded the
+        // upper bound), so each chunk lives at its own offset within the
+        // slot — no buffer reuse across chunks within an AR.
+        const int    chunk_max       = (int) (GGML_CUDA_AR_HYBRID_CHUNK_BYTES / type_size);
+        const int    n_chunks        = (int) ((ne + chunk_max - 1) / chunk_max);
+        const size_t input_type_size = ggml_type_size(input_type);
+
+        const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+
+        for (int i = 0; i < n; ++i) {
+            const int peer = 1 - i;
+            ggml_cuda_set_device(p->devices[i]);
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            cudaStream_t stream = cuda_ctx->stream();
+
+            char * data = static_cast<char *>(tensors[i]->data);
+
+            if (!compute_flag[i] && !use_bf16) {
+                CUDA_CHECK(cudaMemsetAsync(data, 0, (size_t) ne * input_type_size, stream));
+            }
+
+#define LAUNCH_HYBRID_KERNEL(Tdst, Twire) \
+            ggml_cuda_ar_kernel_hybrid<Tdst, Twire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const Tdst *>(data), \
+                reinterpret_cast<Tdst *>(data), \
+                reinterpret_cast<Twire *>(p->host_buf[i].dev    + (size_t) slot * p->buf_bytes), \
+                reinterpret_cast<const Twire *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes), \
+                static_cast<int>(ne), \
+                chunk_max, \
+                n_chunks, \
+                ggml_cuda_ar_arrival_ptr(p, slot, i), \
+                ggml_cuda_ar_arrival_ptr(p, slot, peer), \
+                token)
+
+            if (use_bf16) {
+                GGML_ASSERT(input_type == GGML_TYPE_F32);
+                LAUNCH_HYBRID_KERNEL(float, __nv_bfloat16);
+            } else {
+                switch (input_type) {
+                    case GGML_TYPE_F32:  LAUNCH_HYBRID_KERNEL(float,         float);         break;
+                    case GGML_TYPE_F16:  LAUNCH_HYBRID_KERNEL(half,          half);          break;
+                    case GGML_TYPE_BF16: LAUNCH_HYBRID_KERNEL(__nv_bfloat16, __nv_bfloat16); break;
+                    default: GGML_ASSERT(false);
+                }
+            }
+
+#undef LAUNCH_HYBRID_KERNEL
+            CUDA_CHECK(cudaGetLastError());
+
+            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, stream));
         }
     } else {
         // host_buf carries Twire-typed data; max_chunk_elems is the count that
