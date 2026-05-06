@@ -39,7 +39,7 @@
 // One int per (slot, rank) pair in pinned host memory.  Each AR call writes a
 // strictly increasing token (= the AR call number) into its own arrival int.
 // The peer spins until its read of the other's arrival int equals the token
-// it expects for this call — a mismatch means the peer hasn't arrived yet.
+// it expects for this call -- a mismatch means the peer hasn't arrived yet.
 // Tokens never repeat over realistic call rates (32-bit int wraps in tens of
 // days at thousands of ARs/sec), so arrival ints don't need to be reset
 // between calls; we initialize once at pipeline init and let the values
@@ -73,11 +73,11 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
 // ---------------------------------------------------------------------------
-// Chunked-kernel AllReduce — 2 GPUs, supports float, half, and bfloat16.
+// Chunked-kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 //
 // Both GPUs run this kernel simultaneously on independent streams.  sendbuf
 // and recvbuf live in Tdst (the caller's tensor type); host_mine / host_other
-// carry data in Twire (the on-wire type, possibly narrower than Tdst — e.g.
+// carry data in Twire (the on-wire type, possibly narrower than Tdst -- e.g.
 // Tdst=F32 with Twire=BF16 halves the bytes pushed across PCIe).  When
 // Tdst == Twire the casts below are no-ops.
 //
@@ -94,8 +94,8 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // for its own chunk to be ready on the peer rather than for peer's entire
 // D2H phase, so when the two GPUs drift out of phase one GPU's H2D can
 // overlap with the other's still-in-progress D2H (different PCIe directions
-// on different links).  Buffer is not reused across chunks — host_mine /
-// host_other are sized to the full AR — so peer can read chunk c at any
+// on different links).  Buffer is not reused across chunks -- host_mine /
+// host_other are sized to the full AR -- so peer can read chunk c at any
 // time after we've signalled.
 //
 // Each block has its own arrival-token slot (offset by bid * ARRIVAL_STRIDE);
@@ -147,7 +147,7 @@ static __global__ void ggml_cuda_ar_kernel(
             Twire wire[ELEMS_PER_VEC];
             #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                wire[k] = static_cast<Twire>(sendbuf[off + k]);
+                wire[k] = ggml_cuda_cast<Twire>(sendbuf[off + k]);
             }
             *reinterpret_cast<float4 *>(&host_mine[off]) =
                 *reinterpret_cast<const float4 *>(wire);
@@ -157,7 +157,7 @@ static __global__ void ggml_cuda_ar_kernel(
             const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
             const int leftover   = count - tail_start;
             if (tid < leftover) {
-                host_mine[tail_start + tid] = static_cast<Twire>(sendbuf[tail_start + tid]);
+                host_mine[tail_start + tid] = ggml_cuda_cast<Twire>(sendbuf[tail_start + tid]);
             }
         }
 
@@ -194,17 +194,17 @@ static __global__ void ggml_cuda_ar_kernel(
                 *reinterpret_cast<const float4 *>(&host_other[off]);
             #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                const Twire d_low = static_cast<Twire>(sendbuf[off + k]);
-                recvbuf[off + k] = static_cast<Tdst>(d_low) + static_cast<Tdst>(wire[k]);
+                const Twire d_low = ggml_cuda_cast<Twire>(sendbuf[off + k]);
+                recvbuf[off + k] = ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(wire[k]);
             }
         }
         if (is_last && bid == 0) {
             const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
             const int leftover   = count - tail_start;
             if (tid < leftover) {
-                const Twire d_low = static_cast<Twire>(sendbuf[tail_start + tid]);
+                const Twire d_low = ggml_cuda_cast<Twire>(sendbuf[tail_start + tid]);
                 recvbuf[tail_start + tid] =
-                    static_cast<Tdst>(d_low) + static_cast<Tdst>(host_other[tail_start + tid]);
+                    ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(host_other[tail_start + tid]);
             }
         }
     }
@@ -213,8 +213,8 @@ static __global__ void ggml_cuda_ar_kernel(
 // Combined load-convert-add kernel.  The peer's contribution arrives as Tsrc
 // (which may be a lower-precision type than Tdst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
-// through Tsrc's precision via a static_cast — peer already truncated its own
-// value the same way before sending — so both sides perform identical
+// through Tsrc's precision via ggml_cuda_cast -- peer already truncated its own
+// value the same way before sending -- so both sides perform identical
 // arithmetic.  When Tdst == Tsrc the round-trip cast is a no-op.
 template <typename Tdst, typename Tsrc>
 static __global__ void ggml_cuda_ar_add_kernel(
@@ -224,8 +224,8 @@ static __global__ void ggml_cuda_ar_add_kernel(
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int nt  = gridDim.x * blockDim.x;
     for (int i = tid; i < count; i += nt) {
-        const Tsrc d_low = static_cast<Tsrc>(dst[i]);
-        dst[i] = static_cast<Tdst>(d_low) + static_cast<Tdst>(src[i]);
+        const Tsrc d_low = ggml_cuda_cast<Tsrc>(dst[i]);
+        dst[i] = ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(src[i]);
     }
 }
 
@@ -235,7 +235,7 @@ static __global__ void ggml_cuda_ar_add_kernel(
 
 // Number of slots in the event / arrival ring.  Two slots is sufficient:
 // lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-// slot[N%2] is always safe to reuse — peer has already consumed slot[N%2]
+// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
 // from AR N-2 by the time we get to AR N.  acquire_slot's
 // cudaEventSynchronize on ev.ker for both devices makes that consumption
 // explicit before we overwrite host_buf[slot] for the new AR.
@@ -244,7 +244,7 @@ static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 // Maximum AR wire size (bytes per GPU) handled by the chunked-kernel /
 // hybrid-kernel path.  host_buf is sized to this per pool slot, so it must
 // also accommodate the full hybrid AR (which doesn't reuse buffer slots
-// across chunks within an AR — that's what enables cross-GPU phase overlap).
+// across chunks within an AR -- that's what enables cross-GPU phase overlap).
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
 
 // Hybrid kernel chunk size (BF16 wire bytes).  Smaller = finer-grain pipeline
@@ -255,7 +255,7 @@ static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
 
 // Per-AR token stride.  Each AR reserves this many consecutive token values:
 // one per inner sync (post-D2H of each chunk) for the hybrid kernel.  256
-// leaves room for up to 256 chunks per AR — plenty for any chunk size we'd
+// leaves room for up to 256 chunks per AR -- plenty for any chunk size we'd
 // realistically shmoo.
 static constexpr int GGML_CUDA_AR_TOKEN_STRIDE = 256;
 
@@ -274,7 +274,7 @@ static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 4 * 1024 * 1024; /
 static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MIN = 512 * 1024;       // 512 KB
 static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX = 2 * 1024 * 1024;  // 2 MB
 // Absolute floor that an env-var override is allowed to set; this caps the
-// per-slot copy-event array.  256 KB → up to 128 chunks per 32 MB tensor.
+// per-slot copy-event array.  256 KB -> up to 128 chunks per 32 MB tensor.
 static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN = 256 * 1024;
 static constexpr int GGML_CUDA_AR_COPY_MAX_CHUNKS =
     static_cast<int>((GGML_CUDA_AR_COPY_MAX_BYTES + GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN - 1) /
@@ -283,13 +283,13 @@ static constexpr int GGML_CUDA_AR_COPY_MAX_CHUNKS =
 struct ggml_cuda_ar_event_slot {
     cudaEvent_t app = nullptr;  // upstream computation complete
     cudaEvent_t cpy[GGML_CUDA_AR_COPY_MAX_CHUNKS] = {};  // copy-engine D2H chunks complete
-    cudaEvent_t h2d = nullptr;  // copy-engine H2Ds complete (handoff AR stream → compute stream)
+    cudaEvent_t h2d = nullptr;  // copy-engine H2Ds complete (handoff AR stream -> compute stream)
     cudaEvent_t ker = nullptr;  // AllReduce kernel complete
 };
 
 // Mapped pinned host allocation: cudaHostAlloc + cudaHostGetDevicePointer
 // in one place, with the host handle preserved for cudaFreeHost.  Used where
-// the CPU never touches the buffer — only the device reads/writes via the
+// the CPU never touches the buffer -- only the device reads/writes via the
 // mapped device pointer.  Required on systems where cudaDevAttrCanUseHost-
 // PointerForRegisteredMem is 0 and the host pointer can't be used as a
 // device pointer.
@@ -354,7 +354,7 @@ struct ggml_cuda_ar_pipeline {
     bool                     dev_tmp_kernel_done_valid;
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
-    // memory; CPU never reads/writes — only the kernel and cudaMemset.
+    // memory; CPU never reads/writes -- only the kernel and cudaMemset.
     // Use ggml_cuda_ar_arrival_ptr() to index.
     ggml_cuda_ar_host_mapping arrival;
 };
@@ -508,7 +508,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // Per-device pinned staging buffers — POOL_SIZE-deep ring so the chunked-
+    // Per-device pinned staging buffers -- POOL_SIZE-deep ring so the chunked-
     // kernel can write the next slot's data while the peer is still reading
     // the previous slot's. Indexed by (slot * buf_bytes) at the call site.
     p->buf_bytes = GGML_CUDA_AR_MAX_BYTES;
@@ -637,7 +637,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         // Wait for peer's H2D from our host_large[i] (recorded in the
         // previous AR's stage 2) to complete before we overwrite host_large[i].
         // host_large_read_done[peer] = peer finished reading host_large[i].
-        // No-op on the first AR — no prior record exists.
+        // No-op on the first AR -- no prior record exists.
         if (p->host_large_read_done_valid) {
             const int peer = 1 - i;
             CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
@@ -663,7 +663,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
     // local device scratch (dev_tmp), then performs one device-local add over
     // the assembled peer tensor.  The H2Ds run on the AR stream (copy engine)
     // and the add_kernel runs on the caller's compute stream, so the AR stream
-    // stays pure-copy and avoids an in-stream copy→compute engine switch every
+    // stays pure-copy and avoids an in-stream copy->compute engine switch every
     // AR.  dev_tmp is single-buffered: the AR stream waits cross-stream on the
     // prior AR's add_kernel-done event before overwriting it.
     for (int i = 0; i < 2; ++i) {
@@ -723,7 +723,7 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
 // Outer-level chunker: copy_impl handles up to copy_bytes per call (limited by
 // the host_large / dev_tmp allocation size).  When the full AR exceeds that,
 // slice the tensor into copy_bytes-sized pieces and call copy_impl repeatedly.
-// Each slice goes through its own stage 1 → stage 2 cycle and acquires its own
+// Each slice goes through its own stage 1 -> stage 2 cycle and acquires its own
 // slot, so cross-AR fences and pool wraparound work the same way as for any
 // other sequence of small ARs.
 template <typename Tsrc, typename Tdst>
@@ -792,7 +792,7 @@ bool ggml_cuda_ar_allreduce(
 
     // Path selection: kernel for AR ≤ copy_threshold, copy-engine above.  The
     // kernel itself further splits into n_chunks of HYBRID_CHUNK_BYTES with
-    // per-chunk D2H/H2D pipeline sync — single-chunk and multi-chunk are the
+    // per-chunk D2H/H2D pipeline sync -- single-chunk and multi-chunk are the
     // same code path.  No upper bound on copy-engine: copy_outer slices
     // reductions larger than copy_bytes into copy_bytes-sized pieces.
     const bool use_copy_engine =
@@ -892,7 +892,7 @@ bool ggml_cuda_ar_allreduce(
         // Kernel path: single launch per device.  The kernel internally splits
         // the AR into n_chunks of HYBRID_CHUNK_BYTES and uses per-chunk
         // pipeline sync; n_chunks=1 is the small-AR fast path.  Runs entirely
-        // on the caller's compute stream — AR is a barrier here, so same-
+        // on the caller's compute stream -- AR is a barrier here, so same-
         // stream ordering subsumes the cross-stream event handshake that the
         // copy-engine path needs and avoids its scheduling overhead.  Only
         // ev.ker is still recorded for acquire_slot's pool-wraparound check.
