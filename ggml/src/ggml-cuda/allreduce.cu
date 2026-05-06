@@ -427,14 +427,14 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // Require Ampere or newer on every participating device
+    // Require Turing or newer on every participating device
     const ggml_cuda_device_info & info = ggml_cuda_info();
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = info.devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_AMPERE) {
+        if (cc < GGML_CUDA_CC_TURING) {
             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
                            "(device %d has cc=%d); falling back\n",
-                           __func__, GGML_CUDA_CC_AMPERE, devices[i], cc);
+                           __func__, GGML_CUDA_CC_TURING, devices[i], cc);
             return nullptr;
         }
     }
