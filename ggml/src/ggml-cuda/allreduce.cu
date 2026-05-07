@@ -76,10 +76,10 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // Chunked-kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 //
 // Both GPUs run this kernel simultaneously on independent streams.  sendbuf
-// and recvbuf live in Tdst (the caller's tensor type); host_mine / host_other
-// carry data in Twire (the on-wire type, possibly narrower than Tdst -- e.g.
-// Tdst=F32 with Twire=BF16 halves the bytes pushed across PCIe).  When
-// Tdst == Twire the casts below are no-ops.
+// and recvbuf live in T_dst (the caller's tensor type); host_mine / host_other
+// carry data in T_wire (the on-wire type, possibly narrower than T_dst -- e.g.
+// T_dst=F32 with T_wire=BF16 halves the bytes pushed across PCIe).  When
+// T_dst == T_wire the casts below are no-ops.
 //
 // The AR is split into n_chunks pieces of up to chunk_max elements each.
 // Each block (8 of them) stripes vectors across (gridDim.x * blockDim.x)
@@ -109,20 +109,20 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // Outer call_count advances by GGML_CUDA_AR_TOKEN_STRIDE so the inner
 // per-chunk tokens never overlap with adjacent ARs.
 // ---------------------------------------------------------------------------
-template <typename Tdst, typename Twire>
+template <typename T_dst, typename T_wire>
 static __global__ void ggml_cuda_ar_kernel(
-        const Tdst  * __restrict__ sendbuf,
-        Tdst        * __restrict__ recvbuf,
-        Twire       * __restrict__ host_mine,
-        const Twire * __restrict__ host_other,
-        int                        count,
-        int                        chunk_max,
-        int                        n_chunks,
-        int *                      arrival_mine,
-        int *                      arrival_other,
-        int                        token) {
+        const T_dst  * __restrict__ sendbuf,
+        T_dst        * __restrict__ recvbuf,
+        T_wire       * __restrict__ host_mine,
+        const T_wire * __restrict__ host_other,
+        int                         count,
+        int                         chunk_max,
+        int                         n_chunks,
+        int *                       arrival_mine,
+        int *                       arrival_other,
+        int                         token) {
 
-    constexpr int ELEMS_PER_VEC = 16 / sizeof(Twire);
+    constexpr int ELEMS_PER_VEC = 16 / sizeof(T_wire);
     constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
 
     const int tid  = threadIdx.x;
@@ -144,10 +144,10 @@ static __global__ void ggml_cuda_ar_kernel(
 
         for (int i = gtid; i < chunk_vec; i += gnt) {
             const int off = chunk_offset + i * ELEMS_PER_VEC;
-            Twire wire[ELEMS_PER_VEC];
+            T_wire wire[ELEMS_PER_VEC];
             #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                wire[k] = ggml_cuda_cast<Twire>(sendbuf[off + k]);
+                wire[k] = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
             }
             ggml_cuda_memcpy_1<sizeof(wire)>(&host_mine[off], wire);
         }
@@ -156,7 +156,7 @@ static __global__ void ggml_cuda_ar_kernel(
             const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
             const int leftover   = count - tail_start;
             if (tid < leftover) {
-                host_mine[tail_start + tid] = ggml_cuda_cast<Twire>(sendbuf[tail_start + tid]);
+                host_mine[tail_start + tid] = ggml_cuda_cast<T_wire>(sendbuf[tail_start + tid]);
             }
         }
 
@@ -188,42 +188,42 @@ static __global__ void ggml_cuda_ar_kernel(
 
         for (int i = gtid; i < chunk_vec; i += gnt) {
             const int off = chunk_offset + i * ELEMS_PER_VEC;
-            Twire wire[ELEMS_PER_VEC];
+            T_wire wire[ELEMS_PER_VEC];
             ggml_cuda_memcpy_1<sizeof(wire)>(wire, &host_other[off]);
             #pragma unroll
             for (int k = 0; k < ELEMS_PER_VEC; ++k) {
-                const Twire d_low = ggml_cuda_cast<Twire>(sendbuf[off + k]);
-                recvbuf[off + k] = ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(wire[k]);
+                const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[off + k]);
+                recvbuf[off + k] = ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(wire[k]);
             }
         }
         if (is_last && bid == 0) {
             const int tail_start = chunk_offset + chunk_vec * ELEMS_PER_VEC;
             const int leftover   = count - tail_start;
             if (tid < leftover) {
-                const Twire d_low = ggml_cuda_cast<Twire>(sendbuf[tail_start + tid]);
+                const T_wire d_low = ggml_cuda_cast<T_wire>(sendbuf[tail_start + tid]);
                 recvbuf[tail_start + tid] =
-                    ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(host_other[tail_start + tid]);
+                    ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(host_other[tail_start + tid]);
             }
         }
     }
 }
 
-// Combined load-convert-add kernel.  The peer's contribution arrives as Tsrc
-// (which may be a lower-precision type than Tdst when the BF16 round-trip is
+// Combined load-convert-add kernel.  The peer's contribution arrives as T_src
+// (which may be a lower-precision type than T_dst when the BF16 round-trip is
 // active).  For bit-equivalence between the two GPUs, dst is first rounded
-// through Tsrc's precision via ggml_cuda_cast -- peer already truncated its own
+// through T_src's precision via ggml_cuda_cast -- peer already truncated its own
 // value the same way before sending -- so both sides perform identical
-// arithmetic.  When Tdst == Tsrc the round-trip cast is a no-op.
-template <typename Tdst, typename Tsrc>
+// arithmetic.  When T_dst == T_src the round-trip cast is a no-op.
+template <typename T_dst, typename T_src>
 static __global__ void ggml_cuda_ar_add_kernel(
-        Tdst       * __restrict__ dst,
-        const Tsrc * __restrict__ src,
+        T_dst       * __restrict__ dst,
+        const T_src * __restrict__ src,
         int count) {
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int nt  = gridDim.x * blockDim.x;
     for (int i = tid; i < count; i += nt) {
-        const Tsrc d_low = ggml_cuda_cast<Tsrc>(dst[i]);
-        dst[i] = ggml_cuda_cast<Tdst>(d_low) + ggml_cuda_cast<Tdst>(src[i]);
+        const T_src d_low = ggml_cuda_cast<T_src>(dst[i]);
+        dst[i] = ggml_cuda_cast<T_dst>(d_low) + ggml_cuda_cast<T_dst>(src[i]);
     }
 }
 
@@ -597,18 +597,18 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-// Asymmetric copy_impl: data sent over PCIe in Tsrc precision (one element of
-// nbytes per ne element); accumulated locally into a Tdst buffer.  When
-// Tsrc == Tdst this is the original homogeneous reduction.  When they differ
-// (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through Tsrc
+// Asymmetric copy_impl: data sent over PCIe in T_src precision (one element of
+// nbytes per ne element); accumulated locally into a T_dst buffer.  When
+// T_src == T_dst this is the original homogeneous reduction.  When they differ
+// (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through T_src
 // for bit-equivalence between GPUs and we skip the otherwise-needed
 // post-conversion entirely.
-template <typename Tsrc, typename Tdst>
+template <typename T_src, typename T_dst>
 static bool ggml_cuda_ar_allreduce_copy_impl(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        Tsrc * const            src_buf[GGML_CUDA_MAX_DEVICES],
-        Tdst * const            dst_buf[GGML_CUDA_MAX_DEVICES],
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool              compute[GGML_CUDA_MAX_DEVICES],
         int64_t                 ne,
         size_t                  nbytes) {
@@ -701,9 +701,9 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         if (n_blocks > 1024) {
             n_blocks = 1024;
         }
-        ggml_cuda_ar_add_kernel<Tdst, Tsrc><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
+        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
             dst_buf[i],
-            reinterpret_cast<const Tsrc *>(p->dev_tmp[i]),
+            reinterpret_cast<const T_src *>(p->dev_tmp[i]),
             (int) ne);
         CUDA_CHECK(cudaGetLastError());
 
@@ -725,29 +725,29 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
 // Each slice goes through its own stage 1 -> stage 2 cycle and acquires its own
 // slot, so cross-AR fences and pool wraparound work the same way as for any
 // other sequence of small ARs.
-template <typename Tsrc, typename Tdst>
+template <typename T_src, typename T_dst>
 static bool ggml_cuda_ar_allreduce_copy_outer(
         ggml_cuda_ar_pipeline * p,
         ggml_backend_t        * backends,
-        Tsrc * const            src_buf[GGML_CUDA_MAX_DEVICES],
-        Tdst * const            dst_buf[GGML_CUDA_MAX_DEVICES],
+        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
+        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
         const bool              compute[GGML_CUDA_MAX_DEVICES],
         int64_t                 ne) {
-    const int64_t outer_max_elems = (int64_t) (p->copy_bytes / sizeof(Tsrc));
+    const int64_t outer_max_elems = (int64_t) (p->copy_bytes / sizeof(T_src));
     GGML_ASSERT(outer_max_elems > 0);
 
     bool ok = true;
     for (int64_t outer_start = 0; outer_start < ne && ok; outer_start += outer_max_elems) {
         const int64_t outer_ne     = std::min(outer_max_elems, ne - outer_start);
-        const size_t  outer_nbytes = (size_t) outer_ne * sizeof(Tsrc);
+        const size_t  outer_nbytes = (size_t) outer_ne * sizeof(T_src);
 
-        Tsrc * src[GGML_CUDA_MAX_DEVICES];
-        Tdst * dst[GGML_CUDA_MAX_DEVICES];
+        T_src * src[GGML_CUDA_MAX_DEVICES];
+        T_dst * dst[GGML_CUDA_MAX_DEVICES];
         for (int i = 0; i < p->n_devices; ++i) {
             src[i] = src_buf[i] + outer_start;
             dst[i] = dst_buf[i] + outer_start;
         }
-        ok = ggml_cuda_ar_allreduce_copy_impl<Tsrc, Tdst>(
+        ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
             p, backends, src, dst, compute, outer_ne, outer_nbytes);
     }
     return ok;
@@ -924,12 +924,12 @@ bool ggml_cuda_ar_allreduce(
                 CUDA_CHECK(cudaMemsetAsync(data, 0, (size_t) ne * input_type_size, stream));
             }
 
-#define LAUNCH_AR_KERNEL(Tdst, Twire) \
-            ggml_cuda_ar_kernel<Tdst, Twire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
-                reinterpret_cast<const Tdst *>(data), \
-                reinterpret_cast<Tdst *>(data), \
-                reinterpret_cast<Twire *>(p->host_buf[i].dev    + (size_t) slot * p->buf_bytes), \
-                reinterpret_cast<const Twire *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes), \
+#define LAUNCH_AR_KERNEL(T_dst, T_wire) \
+            ggml_cuda_ar_kernel<T_dst, T_wire><<<dim3(GGML_CUDA_AR_KERNEL_BLOCKS), dim3(256), 0, stream>>>( \
+                reinterpret_cast<const T_dst *>(data), \
+                reinterpret_cast<T_dst *>(data), \
+                reinterpret_cast<T_wire *>(p->host_buf[i].dev    + (size_t) slot * p->buf_bytes), \
+                reinterpret_cast<const T_wire *>(p->host_buf[peer].dev + (size_t) slot * p->buf_bytes), \
                 static_cast<int>(ne), \
                 chunk_max, \
                 n_chunks, \
