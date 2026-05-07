@@ -122,7 +122,7 @@ static __global__ void ggml_cuda_ar_kernel(
         int *                       arrival_other,
         int                         token) {
 
-    constexpr int ELEMS_PER_VEC = 16 / sizeof(T_wire);
+    constexpr int ELEMS_PER_VEC = ggml_cuda_get_max_cpy_bytes() / sizeof(T_wire);
     constexpr int ARRIVAL_INTS  = (int)(GGML_CUDA_AR_ARRIVAL_STRIDE / sizeof(int));
 
     const int tid  = threadIdx.x;
