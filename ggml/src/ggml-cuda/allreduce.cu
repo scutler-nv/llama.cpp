@@ -67,7 +67,7 @@ static __device__ __forceinline__ int ggml_cuda_ar_signal_get(const int * p) {
 // false-sharing stalls on the polling GPU.
 static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 
-// Number of blocks the chunked-kernel launches with.  Each block stripes a
+// Number of blocks the chunked kernel launches with.  Each block stripes a
 // disjoint slice of the data and synchronizes through its own arrival-token
 // slot so multiple SMs can pump PCIe stores in parallel.
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
@@ -239,8 +239,8 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // explicit before we overwrite host_buf[slot] for the new AR.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
 
-// Maximum AR wire size (bytes per GPU) handled by the chunked-kernel /
-// hybrid-kernel path.  host_buf is sized to this per pool slot, so it must
+// Maximum AR wire size (bytes per GPU) handled by the chunked kernel /
+// hybrid kernel path.  host_buf is sized to this per pool slot, so it must
 // also accommodate the full hybrid AR (which doesn't reuse buffer slots
 // across chunks within an AR -- that's what enables cross-GPU phase overlap).
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
@@ -331,7 +331,7 @@ struct ggml_cuda_ar_pipeline {
     uint64_t call_count;
 
     // Per-device resources.
-    ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked-kernel)
+    ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
     cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
@@ -541,7 +541,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %d GPUs, "
-                  "%zu KB chunked-kernel staging + %zu MB copy-engine staging per GPU\n",
+                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
 
     return p;
@@ -799,7 +799,7 @@ bool ggml_cuda_ar_allreduce(
         nbytes >= p->copy_threshold;
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
-    // (chunked-kernel path) and the combined add kernel (copy_engine path)
+    // (chunked kernel path) and the combined add kernel (copy_engine path)
     // both accumulate into the F32 tensor data directly, so an inactive
     // shard's accumulator must start at zero.
     if (use_bf16) {
@@ -814,7 +814,7 @@ bool ggml_cuda_ar_allreduce(
     }
 
     // Pre-convert F32 -> BF16 into bf16_tmp ONLY for the copy_engine + use_bf16
-    // path; the chunked-kernel path's combined kernel does the conversion
+    // path; the chunked kernel path's combined kernel does the conversion
     // inline as it writes to host_buf.
     ggml_cuda_pool_alloc<nv_bfloat16> bf16_tmp[GGML_CUDA_MAX_DEVICES];
     void * copy_src_ptr[GGML_CUDA_MAX_DEVICES] = {};
