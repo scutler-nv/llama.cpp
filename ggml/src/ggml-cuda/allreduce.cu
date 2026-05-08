@@ -26,11 +26,12 @@
 //   * Copy-engine path (large reductions): the transfer is split into
 //     D2H + H2D cudaMemcpyAsync chunks driven by the GPU's copy engine,
 //     followed by a small device-side add kernel.  Cross-GPU
-//     synchronization happens *outside the kernel*, via CUDA events
-//     between streams.  This keeps the compute engine free while large
-//     transfers are in flight, which matters for prefill-sized tensors.
-//     Reductions larger than the per-call inner cap are processed by an
-//     outer chunker that issues sequential inner calls.
+//     synchronization happens *outside the kernel*, via CUDA events between
+//     streams.  This keeps the compute engine free while large transfers
+//     are in flight, which matters for prefill-sized tensors.  host_large
+//     and dev_tmp work as ring buffers indexed by chunk slot, so reductions
+//     larger than copy_bytes recycle slots within the same call -- no outer
+//     chunker needed.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -274,15 +275,16 @@ static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_HEURISTIC_MAX = 2 * 1024 *
 // Absolute floor that an env-var override is allowed to set; this caps the
 // per-slot copy-event array.  256 KB -> up to 128 chunks per 32 MB tensor.
 static constexpr size_t GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN = 256 * 1024;
-static constexpr int GGML_CUDA_AR_COPY_MAX_CHUNKS =
+// Maximum number of slots host_large is sliced into; equals (host_large_bytes
+// / chunk_bytes_min).  Typical operation uses 16 slots (32 MB / 2 MB).  Sets
+// the size of the per-(GPU, slot) write/read event arrays.
+static constexpr int GGML_CUDA_AR_COPY_MAX_SLOTS =
     static_cast<int>((GGML_CUDA_AR_COPY_MAX_BYTES + GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN - 1) /
                     GGML_CUDA_AR_COPY_CHUNK_BYTES_MIN);
 
 struct ggml_cuda_ar_event_slot {
     cudaEvent_t app = nullptr;  // upstream computation complete
-    cudaEvent_t cpy[GGML_CUDA_AR_COPY_MAX_CHUNKS] = {};  // copy-engine D2H chunks complete
-    cudaEvent_t h2d = nullptr;  // copy-engine H2Ds complete (handoff AR stream -> compute stream)
-    cudaEvent_t ker = nullptr;  // AllReduce kernel complete
+    cudaEvent_t ker = nullptr;  // end-of-AR (slot-pool wraparound)
 };
 
 // Mapped pinned host allocation: cudaHostAlloc + cudaHostGetDevicePointer
@@ -336,22 +338,17 @@ struct ggml_cuda_ar_pipeline {
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
-    cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
-    ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
+    cudaStream_t              streams[GGML_CUDA_MAX_DEVICES];    // per-device AR stream (copy-engine path)
+    ggml_cuda_ar_event_slot   ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
 
-    // Copy-engine: per-device "I finished reading my peer's host_large"
-    // event.  Indexed by RECORDER device.  Recorded same-device on streams[i]
-    // after stage 2's last H2D from host_large[peer].  Waited cross-device
-    // by peer's stage-1 stream before the next AR overwrites host_large[peer].
-    cudaEvent_t              host_large_read_done[GGML_CUDA_MAX_DEVICES];
-    bool                     host_large_read_done_valid;
-
-    // Copy-engine: per-device "my add_kernel is done with dev_tmp" event.
-    // Recorded on the compute stream after each add_kernel; the AR stream
-    // waits on it before the next copy_impl's H2D overwrites dev_tmp.  Lets us
-    // single-buffer dev_tmp despite add_kernel running on a separate stream.
-    cudaEvent_t              dev_tmp_kernel_done[GGML_CUDA_MAX_DEVICES];
-    bool                     dev_tmp_kernel_done_valid;
+    // Copy-engine path: per-(GPU, slot) write/read events.  Reused across
+    // waves WITHIN one AR (cross-GPU per-chunk fence) and across ARs
+    // (host_large slot-reuse fence -- peer must finish reading our
+    // host_large[s] before we overwrite it on the next AR / next wave).
+    // Single AR stream per GPU serializes everything else; these are the
+    // only cross-GPU synchronization points the copy path needs.
+    cudaEvent_t write_ev[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_COPY_MAX_SLOTS];
+    cudaEvent_t read_ev [GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_COPY_MAX_SLOTS];
 
     // Arrival ring: ARRIVAL_STRIDE bytes between adjacent ints.  Mapped pinned
     // memory; CPU never reads/writes -- only the kernel and cudaMemset.
@@ -447,27 +444,24 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         p->devices[i] = devices[i];
     }
 
-    // Per-device streams and event pools.
+    // Per-device streams and event pools.  One AR stream per device on the
+    // copy-engine path: stream-sequential ordering serializes ARs and gives
+    // wave-to-wave dev_tmp slot reuse for free, leaving only the cross-GPU
+    // per-chunk events (write_ev / read_ev) as explicit synchronization.
     for (int i = 0; i < n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
 
-        cudaStream_t stream = nullptr;
-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+        if (cudaStreamCreateWithFlags(&p->streams[i], cudaStreamNonBlocking) != cudaSuccess) {
             GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d\n",
                            __func__, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
         }
-        p->streams[i] = stream;
 
         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
             bool ok =
                 cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming) == cudaSuccess &&
-                cudaEventCreateWithFlags(&p->ev_pool[i][s].h2d, cudaEventDisableTiming) == cudaSuccess &&
                 cudaEventCreateWithFlags(&p->ev_pool[i][s].ker, cudaEventDisableTiming) == cudaSuccess;
-            for (int c = 0; ok && c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-                ok = cudaEventCreateWithFlags(&p->ev_pool[i][s].cpy[c], cudaEventDisableTiming) == cudaSuccess;
-            }
             if (!ok) {
                 GGML_LOG_ERROR("%s: cudaEventCreate failed for device %d slot %d\n",
                                __func__, p->devices[i], s);
@@ -476,29 +470,30 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
             }
         }
 
-        if (cudaEventCreateWithFlags(&p->host_large_read_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for host_large_read_done failed for device %d\n",
-                           __func__, p->devices[i]);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
-        }
-        if (cudaEventCreateWithFlags(&p->dev_tmp_kernel_done[i], cudaEventDisableTiming) != cudaSuccess) {
-            GGML_LOG_ERROR("%s: cudaEventCreate for dev_tmp_kernel_done failed for device %d\n",
-                           __func__, p->devices[i]);
-            ggml_cuda_ar_pipeline_free(p);
-            return nullptr;
-        }
-
-        // Pre-record each slot's ev.ker on an idle stream so the first
-        // POOL_SIZE ARs can unconditionally cudaStreamWaitEvent on it without
-        // blocking forever waiting for an unrecorded event.
-        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-            if (cudaEventRecord(p->ev_pool[i][s].ker, p->streams[i]) != cudaSuccess) {
-                GGML_LOG_ERROR("%s: cudaEventRecord (pre-fire) failed for device %d slot %d\n",
+        for (int s = 0; s < GGML_CUDA_AR_COPY_MAX_SLOTS; ++s) {
+            bool ok =
+                cudaEventCreateWithFlags(&p->write_ev[i][s], cudaEventDisableTiming) == cudaSuccess &&
+                cudaEventCreateWithFlags(&p->read_ev [i][s], cudaEventDisableTiming) == cudaSuccess;
+            if (!ok) {
+                GGML_LOG_ERROR("%s: cudaEventCreate (chunk events) failed for device %d slot %d\n",
                                __func__, p->devices[i], s);
                 ggml_cuda_ar_pipeline_free(p);
                 return nullptr;
             }
+        }
+
+        // Pre-record events that may be waited on by the very first AR before
+        // a real record has been issued: ev.ker (slot-pool wraparound) for
+        // every pool slot, and read_ev (cross-AR host_large slot-reuse fence
+        // -- the first AR has no prior owner, so the wait must see an
+        // already-fired event).  write_ev doesn't need pre-recording: it is
+        // only ever waited on after its matching D2H+record has been
+        // host-issued in the same wave.
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][s].ker, p->streams[i]));
+        }
+        for (int s = 0; s < GGML_CUDA_AR_COPY_MAX_SLOTS; ++s) {
+            CUDA_CHECK(cudaEventRecord(p->read_ev[i][s], p->streams[i]));
         }
     }
 
@@ -534,10 +529,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
-    // Copy-engine path: pinned host staging + device scratch, sized for the
-    // largest tensor we accept on this path (GGML_CUDA_AR_COPY_MAX_BYTES).
-    // dev_tmp is single-buffered; cross-AR safety is enforced by an explicit
-    // cross-stream wait in copy_impl on the prior AR's add_kernel-done event.
+    // Copy-engine path: pinned host staging + device scratch, both sliced into
+    // a ring of N_SLOTS = (copy_bytes / chunk_bytes) chunk-sized slots.  Slot
+    // reuse within an AR is per-chunk (host_large) and per-wave (dev_tmp);
+    // cross-AR sync rides on the slot pool's ev.ker as before.
     for (int i = 0; i < n_devices; ++i) {
         ggml_cuda_set_device(p->devices[i]);
         if (p->host_large[i].alloc(p->copy_bytes) != cudaSuccess) {
@@ -566,7 +561,7 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         return;
     }
 
-    // Drain all in-flight kernels before tearing down resources.
+    // Drain all in-flight work before tearing down resources.
     for (int i = 0; i < p->n_devices; ++i) {
         if (p->streams[i]) {
             ggml_cuda_set_device(p->devices[i]);
@@ -583,25 +578,14 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
         }
         ggml_cuda_set_device(p->devices[i]);
         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
-            if (p->ev_pool[i][s].app) { cudaEventDestroy(p->ev_pool[i][s].app); }
-            for (int c = 0; c < GGML_CUDA_AR_COPY_MAX_CHUNKS; ++c) {
-                if (p->ev_pool[i][s].cpy[c]) { cudaEventDestroy(p->ev_pool[i][s].cpy[c]); }
-            }
-            if (p->ev_pool[i][s].h2d) { cudaEventDestroy(p->ev_pool[i][s].h2d); }
-            if (p->ev_pool[i][s].ker) { cudaEventDestroy(p->ev_pool[i][s].ker); }
+            if (p->ev_pool[i][s].app) cudaEventDestroy(p->ev_pool[i][s].app);
+            if (p->ev_pool[i][s].ker) cudaEventDestroy(p->ev_pool[i][s].ker);
         }
-        if (p->host_large_read_done[i]) {
-            ggml_cuda_set_device(p->devices[i]);
-            cudaEventDestroy(p->host_large_read_done[i]);
+        for (int s = 0; s < GGML_CUDA_AR_COPY_MAX_SLOTS; ++s) {
+            if (p->write_ev[i][s]) cudaEventDestroy(p->write_ev[i][s]);
+            if (p->read_ev [i][s]) cudaEventDestroy(p->read_ev [i][s]);
         }
-        if (p->dev_tmp_kernel_done[i]) {
-            ggml_cuda_set_device(p->devices[i]);
-            cudaEventDestroy(p->dev_tmp_kernel_done[i]);
-        }
-        if (p->streams[i]) {
-            ggml_cuda_set_device(p->devices[i]);
-            cudaStreamDestroy(p->streams[i]);
-        }
+        if (p->streams[i]) cudaStreamDestroy(p->streams[i]);
     }
     p->arrival.free();
     delete p;
@@ -611,12 +595,37 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-// Asymmetric copy_impl: data sent over PCIe in T_src precision (one element of
-// nbytes per ne element); accumulated locally into a T_dst buffer.  When
-// T_src == T_dst this is the original homogeneous reduction.  When they differ
-// (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through T_src
-// for bit-equivalence between GPUs and we skip the otherwise-needed
+// Asymmetric copy_engine path: data sent over PCIe in T_src precision (one
+// element of nbytes per ne element); accumulated locally into a T_dst buffer.
+// When T_src == T_dst this is the original homogeneous reduction.  When they
+// differ (e.g. BF16 wire / F32 accumulator) the add kernel rounds dst through
+// T_src for bit-equivalence between GPUs and we skip the otherwise-needed
 // post-conversion entirely.
+//
+// Pipeline layout
+// ---------------
+//  * One AR stream per device.  Within a wave, we issue all N_SLOTS D2Hs
+//    back-to-back, then all N_SLOTS H2Ds, then a single add_kernel covering
+//    the wave -- in nSight this looks like a block of D2H rectangles
+//    followed by a block of H2D rectangles on each GPU's copy engine, which
+//    is the "32 MB read, 32 MB write" pattern PCIe likes.  Stream-sequential
+//    ordering on the AR stream gives wave-to-wave dev_tmp slot reuse and
+//    cross-AR ordering for free, so the only explicit synchronization is
+//    cross-GPU per-chunk events.
+//  * host_large[i] is sliced into N_SLOTS = (host_large_size / chunk_bytes)
+//    chunk-sized slots; dev_tmp[i] uses the same indexing.  In typical
+//    operation N_SLOTS = 16 (32 MB / 2 MB) -- 2 events per slot per GPU
+//    gives the user-visible "64 events for hostmem management".
+//  * Per-(GPU, slot) events:
+//      write_ev[s] - device i's D2H[s] done.  Peer waits before its H2D[s].
+//      read_ev[s]  - device i's H2D[s] done.  Peer waits before its next D2H
+//                    that will overwrite host_large[s] (next wave within this
+//                    AR, or wave 0 of the next AR).
+//
+// read_ev[s] and ev.ker are pre-recorded at pipeline init so the first AR's
+// cross-AR waits and slot-pool wraparound see an already-fired event.
+// write_ev doesn't need pre-recording: it is only ever waited on after its
+// matching D2H+record has been host-issued in the same wave.
 template <typename T_src, typename T_dst>
 static bool ggml_cuda_ar_allreduce_copy_impl(
         ggml_cuda_ar_pipeline * p,
@@ -627,144 +636,142 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
         int64_t                 ne,
         size_t                  nbytes) {
     GGML_ASSERT(p->n_devices == 2);
-    GGML_ASSERT(nbytes <= p->copy_bytes);
     GGML_ASSERT(ne <= std::numeric_limits<int>::max());
 
     const size_t chunk_bytes = ggml_cuda_ar_chunk_bytes(p, nbytes);
     GGML_ASSERT(chunk_bytes > 0);
 
-    const int slot = ggml_cuda_ar_acquire_slot(p).slot;
-    const size_t copy_chunks = (nbytes + chunk_bytes - 1) / chunk_bytes;
-    GGML_ASSERT(copy_chunks <= GGML_CUDA_AR_COPY_MAX_CHUNKS);
+    const int n_chunks = (int) ((nbytes + chunk_bytes - 1) / chunk_bytes);
+    const int n_slots  = (int) (p->copy_bytes / chunk_bytes);
+    const int n_waves  = (n_chunks + n_slots - 1) / n_slots;
+    GGML_ASSERT(n_slots  >= 1);
+    GGML_ASSERT(n_slots  <= GGML_CUDA_AR_COPY_MAX_SLOTS);
+
+    const auto [slot, _token] = ggml_cuda_ar_acquire_slot(p);
 
     ggml_backend_cuda_context * cuda_ctx[2] = {};
-
-    // Stage 1: both GPUs copy their local contribution to pinned host memory.
     for (int i = 0; i < 2; ++i) {
-        ggml_cuda_set_device(p->devices[i]);
         cuda_ctx[i] = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
         GGML_ASSERT(cuda_ctx[i]->device == p->devices[i]);
-
-        ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
-
-        // Wait for peer's H2D from our host_large[i] (recorded in the
-        // previous AR's stage 2) to complete before we overwrite host_large[i].
-        // host_large_read_done[peer] = peer finished reading host_large[i].
-        // No-op on the first AR -- no prior record exists.
-        if (p->host_large_read_done_valid) {
-            const int peer = 1 - i;
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
-        }
-
-        if (!compute[i]) {
-            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
-        }
-
-        for (size_t c = 0; c < copy_chunks; ++c) {
-            const size_t offset = c * chunk_bytes;
-            const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
-                (nbytes - offset) : chunk_bytes;
-
-            CUDA_CHECK(cudaMemcpyAsync(
-                p->host_large[i].host + offset, reinterpret_cast<char *>(src_buf[i]) + offset, this_bytes,
-                cudaMemcpyDeviceToHost, p->streams[i]));
-            CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].cpy[c], p->streams[i]));
-        }
     }
 
-    // Stage 2: each GPU waits for each peer D2H chunk, pulls that chunk back to
-    // local device scratch (dev_tmp), then performs one device-local add over
-    // the assembled peer tensor.  The H2Ds run on the AR stream (copy engine)
-    // and the add_kernel runs on the caller's compute stream, so the AR stream
-    // stays pure-copy and avoids an in-stream copy->compute engine switch every
-    // AR.  dev_tmp is single-buffered: the AR stream waits cross-stream on the
-    // prior AR's add_kernel-done event before overwriting it.
+    // Cross-AR fence: peer's POOL_SIZE-prior AR must be done before we start.
+    // Mostly a safety belt -- single-stream serializes copy-path ARs on this
+    // GPU naturally, and the per-slot read_ev waits below cover host_large
+    // slot reuse against any path peer used.  Pre-fired at init for the first
+    // POOL_SIZE ARs.
     for (int i = 0; i < 2; ++i) {
         const int peer = 1 - i;
         ggml_cuda_set_device(p->devices[i]);
-
-        // Wait for the previous AR's add_kernel (on the compute stream) to
-        // finish reading dev_tmp before our H2D overwrites it.  No-op on the
-        // first copy_impl call.
-        if (p->dev_tmp_kernel_done_valid) {
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
-        }
-
-        for (size_t c = 0; c < copy_chunks; ++c) {
-            const size_t offset = c * chunk_bytes;
-            const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
-                (nbytes - offset) : chunk_bytes;
-
-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].cpy[c]));
-            CUDA_CHECK(cudaMemcpyAsync(
-                p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
-                cudaMemcpyHostToDevice, p->streams[i]));
-        }
-
-        // Mark our reads of host_large[peer] complete so peer's next AR can
-        // safely overwrite it.
-        CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], p->streams[i]));
-
-        // Hand off from AR stream (copy engine) to compute stream: compute
-        // stream waits for all H2Ds to finish, then runs the add_kernel.
-        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
-        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
-
-        const int block_size = 256;
-        int n_blocks = (int) ((ne + block_size - 1) / block_size);
-        if (n_blocks > 1024) {
-            n_blocks = 1024;
-        }
-        ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, cuda_ctx[i]->stream()>>>(
-            dst_buf[i],
-            reinterpret_cast<const T_src *>(p->dev_tmp[i]),
-            (int) ne);
-        CUDA_CHECK(cudaGetLastError());
-
-        // Record dev_tmp-released on the compute stream so the next copy_impl
-        // can wait for the kernel to finish before overwriting dev_tmp.  Also
-        // record AR-done as ev.ker for acquire_slot's pool-wraparound sync.
-        CUDA_CHECK(cudaEventRecord(p->dev_tmp_kernel_done[i], cuda_ctx[i]->stream()));
-        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, cuda_ctx[i]->stream()));
+        CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].ker, 0));
     }
-    p->host_large_read_done_valid = true;
-    p->dev_tmp_kernel_done_valid = true;
+
+    // Wait for upstream compute on each device before any AR-stream work
+    // touches the source tensor.
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        ggml_cuda_ar_wait_for_compute(p, cuda_ctx[i], i, slot);
+    }
+
+    // Inactive-shard zeroing on the AR stream so it precedes the D2Hs that
+    // read src_buf.
+    for (int i = 0; i < 2; ++i) {
+        if (!compute[i]) {
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaMemsetAsync(src_buf[i], 0, nbytes, p->streams[i]));
+        }
+    }
+
+    // Drive both devices' wave pipelines in lockstep.  Per wave we run three
+    // passes; within a pass we issue for both devices interleaved so the
+    // host-side issue order is correct for cross-device cudaStreamWaitEvent
+    // (a wait captures the event's state AT ISSUE TIME, so peer's record
+    // must be host-issued before our wait).
+    //
+    //   pass A: for each chunk in wave: cross-AR slot-reuse wait (peer's
+    //           read_ev[s]) + D2H + record write_ev[s]
+    //   pass B: for each chunk in wave: wait peer.write_ev[s] + H2D +
+    //           record read_ev[s]
+    //   pass C: launch the wave's add_kernel (covers all N_SLOTS chunks of
+    //           this wave at once)
+    for (int w = 0; w < n_waves; ++w) {
+        const int    chunk_lo  = w * n_slots;
+        const int    chunk_hi  = std::min(chunk_lo + n_slots, n_chunks);
+        const size_t wave_off  = (size_t) chunk_lo * chunk_bytes;
+        const size_t wave_end  = std::min((size_t) chunk_hi * chunk_bytes, nbytes);
+        const size_t wave_size = wave_end - wave_off;
+
+        // Pass A: D2Hs.  Each chunk's D2H waits on peer's read_ev[s] so we
+        // don't overwrite host_large[s] before peer is done reading it (from
+        // the prior wave or, on wave 0, from the prior AR -- pre-fired at
+        // init for the very first AR).
+        for (int c = chunk_lo; c < chunk_hi; ++c) {
+            const int    s          = c % n_slots;
+            const size_t off_src    = (size_t) c * chunk_bytes;
+            const size_t off_slot   = (size_t) s * chunk_bytes;
+            const size_t this_bytes = std::min(chunk_bytes, nbytes - off_src);
+
+            for (int i = 0; i < 2; ++i) {
+                const int peer = 1 - i;
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->read_ev[peer][s], 0));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    p->host_large[i].host + off_slot,
+                    reinterpret_cast<char *>(src_buf[i]) + off_src,
+                    this_bytes, cudaMemcpyDeviceToHost, p->streams[i]));
+                CUDA_CHECK(cudaEventRecord(p->write_ev[i][s], p->streams[i]));
+            }
+        }
+
+        // Pass B: H2Ds.  Each H2D waits on peer's matching write_ev[s] (just
+        // host-issued in pass A); reads from peer's host_large[s] into our
+        // dev_tmp[s].
+        for (int c = chunk_lo; c < chunk_hi; ++c) {
+            const int    s          = c % n_slots;
+            const size_t off_src    = (size_t) c * chunk_bytes;
+            const size_t off_slot   = (size_t) s * chunk_bytes;
+            const size_t this_bytes = std::min(chunk_bytes, nbytes - off_src);
+
+            for (int i = 0; i < 2; ++i) {
+                const int peer = 1 - i;
+                ggml_cuda_set_device(p->devices[i]);
+                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->write_ev[peer][s], 0));
+                CUDA_CHECK(cudaMemcpyAsync(
+                    p->dev_tmp[i] + off_slot,
+                    p->host_large[peer].host + off_slot,
+                    this_bytes, cudaMemcpyHostToDevice, p->streams[i]));
+                CUDA_CHECK(cudaEventRecord(p->read_ev[i][s], p->streams[i]));
+            }
+        }
+
+        // Pass C: wave-level add_kernel on the AR stream.  Stream-sequential
+        // ordering ensures it runs after all H2Ds; the next wave's D2Hs (and
+        // their dev_tmp[s] reuse) are stream-sequential after the kernel.
+        GGML_ASSERT((wave_size % sizeof(T_src)) == 0);
+        const int wave_ne = (int) (wave_size / sizeof(T_src));
+        for (int i = 0; i < 2; ++i) {
+            ggml_cuda_set_device(p->devices[i]);
+            const int block_size = 256;
+            int n_blocks = (wave_ne + block_size - 1) / block_size;
+            if (n_blocks > 1024) n_blocks = 1024;
+            ggml_cuda_ar_add_kernel<T_dst, T_src><<<n_blocks, block_size, 0, p->streams[i]>>>(
+                dst_buf[i] + wave_off / sizeof(T_src),
+                reinterpret_cast<const T_src *>(p->dev_tmp[i]),
+                wave_ne);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+
+    // End-of-AR: record ev.ker on the AR stream, and have the compute stream
+    // wait so subsequent ops see the AR result.  ev.ker also serves as the
+    // POOL_SIZE-back fence for future ARs (kernel or copy path).
+    for (int i = 0; i < 2; ++i) {
+        ggml_cuda_set_device(p->devices[i]);
+        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].ker, p->streams[i]));
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].ker, 0));
+    }
 
     return true;
-}
-
-// Outer-level chunker: copy_impl handles up to copy_bytes per call (limited by
-// the host_large / dev_tmp allocation size).  When the full AR exceeds that,
-// slice the tensor into copy_bytes-sized pieces and call copy_impl repeatedly.
-// Each slice goes through its own stage 1 -> stage 2 cycle and acquires its own
-// slot, so cross-AR fences and pool wraparound work the same way as for any
-// other sequence of small ARs.
-template <typename T_src, typename T_dst>
-static bool ggml_cuda_ar_allreduce_copy_outer(
-        ggml_cuda_ar_pipeline * p,
-        ggml_backend_t        * backends,
-        T_src * const           src_buf[GGML_CUDA_MAX_DEVICES],
-        T_dst * const           dst_buf[GGML_CUDA_MAX_DEVICES],
-        const bool              compute[GGML_CUDA_MAX_DEVICES],
-        int64_t                 ne) {
-    const int64_t outer_max_elems = (int64_t) (p->copy_bytes / sizeof(T_src));
-    GGML_ASSERT(outer_max_elems > 0);
-
-    bool ok = true;
-    for (int64_t outer_start = 0; outer_start < ne && ok; outer_start += outer_max_elems) {
-        const int64_t outer_ne     = std::min(outer_max_elems, ne - outer_start);
-        const size_t  outer_nbytes = (size_t) outer_ne * sizeof(T_src);
-
-        T_src * src[GGML_CUDA_MAX_DEVICES];
-        T_dst * dst[GGML_CUDA_MAX_DEVICES];
-        for (int i = 0; i < p->n_devices; ++i) {
-            src[i] = src_buf[i] + outer_start;
-            dst[i] = dst_buf[i] + outer_start;
-        }
-        ok = ggml_cuda_ar_allreduce_copy_impl<T_src, T_dst>(
-            p, backends, src, dst, compute, outer_ne, outer_nbytes);
-    }
-    return ok;
 }
 
 bool ggml_cuda_ar_allreduce(
@@ -806,8 +813,8 @@ bool ggml_cuda_ar_allreduce(
     // Path selection: kernel for AR ≤ copy_threshold, copy-engine above.  The
     // kernel itself further splits into n_chunks of HYBRID_CHUNK_BYTES with
     // per-chunk D2H/H2D pipeline sync -- single-chunk and multi-chunk are the
-    // same code path.  No upper bound on copy-engine: copy_outer slices
-    // reductions larger than copy_bytes into copy_bytes-sized pieces.
+    // same code path.  Copy-engine handles arbitrary AR sizes via per-chunk
+    // ring-buffer reuse of host_large and per-wave reuse of dev_tmp.
     const bool use_copy_engine =
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
@@ -887,13 +894,13 @@ bool ggml_cuda_ar_allreduce(
         if (use_bf16) {
             GGML_ASSERT(kernel_type == GGML_TYPE_BF16);
             nv_bfloat16 * src[GGML_CUDA_MAX_DEVICES];
-            float         * dst[GGML_CUDA_MAX_DEVICES];
+            float       * dst[GGML_CUDA_MAX_DEVICES];
             for (int i = 0; i < n; ++i) {
                 src[i] = static_cast<nv_bfloat16 *>(copy_src_ptr[i]);
                 dst[i] = static_cast<float *>(tensors[i]->data);
             }
-            ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, float>(
-                p, backends, src, dst, inner_compute, ne);
+            ok = ggml_cuda_ar_allreduce_copy_impl<nv_bfloat16, float>(
+                p, backends, src, dst, inner_compute, ne, (size_t) ne * sizeof(nv_bfloat16));
         } else {
             switch (kernel_type) {
                 case GGML_TYPE_F32: {
@@ -901,8 +908,8 @@ bool ggml_cuda_ar_allreduce(
                     for (int i = 0; i < n; ++i) {
                         buf[i] = static_cast<float *>(tensors[i]->data);
                     }
-                    ok = ggml_cuda_ar_allreduce_copy_outer<float, float>(
-                        p, backends, buf, buf, inner_compute, ne);
+                    ok = ggml_cuda_ar_allreduce_copy_impl<float, float>(
+                        p, backends, buf, buf, inner_compute, ne, (size_t) ne * sizeof(float));
                     break;
                 }
                 case GGML_TYPE_BF16: {
@@ -910,8 +917,8 @@ bool ggml_cuda_ar_allreduce(
                     for (int i = 0; i < n; ++i) {
                         buf[i] = static_cast<nv_bfloat16 *>(tensors[i]->data);
                     }
-                    ok = ggml_cuda_ar_allreduce_copy_outer<nv_bfloat16, nv_bfloat16>(
-                        p, backends, buf, buf, inner_compute, ne);
+                    ok = ggml_cuda_ar_allreduce_copy_impl<nv_bfloat16, nv_bfloat16>(
+                        p, backends, buf, buf, inner_compute, ne, (size_t) ne * sizeof(nv_bfloat16));
                     break;
                 }
                 case GGML_TYPE_F16: {
@@ -919,8 +926,8 @@ bool ggml_cuda_ar_allreduce(
                     for (int i = 0; i < n; ++i) {
                         buf[i] = static_cast<half *>(tensors[i]->data);
                     }
-                    ok = ggml_cuda_ar_allreduce_copy_outer<half, half>(
-                        p, backends, buf, buf, inner_compute, ne);
+                    ok = ggml_cuda_ar_allreduce_copy_impl<half, half>(
+                        p, backends, buf, buf, inner_compute, ne, (size_t) ne * sizeof(half));
                     break;
                 }
                 default:
