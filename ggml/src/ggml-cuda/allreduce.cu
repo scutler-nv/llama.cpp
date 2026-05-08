@@ -237,7 +237,7 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // from AR N-2 by the time we get to AR N.  acquire_slot's
 // cudaEventSynchronize on ev.ker for both devices makes that consumption
 // explicit before we overwrite host_buf[slot] for the new AR.
-static constexpr int GGML_CUDA_AR_POOL_SIZE = 2;
+static constexpr int GGML_CUDA_AR_POOL_SIZE = 8;
 
 // Maximum AR wire size (bytes per GPU) handled by the chunked kernel /
 // hybrid kernel path.  host_buf is sized to this per pool slot, so it must
@@ -328,7 +328,9 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
+    size_t   hybrid_chunk_bytes; // hybrid kernel chunk size; runtime override of compile-time GGML_CUDA_AR_HYBRID_CHUNK_BYTES
     uint64_t call_count;
+    bool     dispatch_logged;    // one-shot: print chosen path + params at first AR
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -382,17 +384,12 @@ struct ggml_cuda_ar_slot_info {
 };
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
-    const int  slot        = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
-    const bool pool_lapped = p->call_count >= GGML_CUDA_AR_POOL_SIZE;
+    const int slot = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     p->call_count++;
-
-    if (pool_lapped) {
-        for (int i = 0; i < p->n_devices; ++i) {
-            ggml_cuda_set_device(p->devices[i]);
-            CUDA_CHECK(cudaEventSynchronize(p->ev_pool[i][slot].ker));
-        }
-    }
-
+    // Slot-reuse fence is no longer here.  Each AR launch site issues a
+    // cross-device cudaStreamWaitEvent on the peer's prior ev.ker for this
+    // slot before the new AR kernel starts -- non-host-blocking, so the host
+    // can keep queuing work while the GPU waits (if it even needs to).
     return { slot, (int) (p->call_count * GGML_CUDA_AR_TOKEN_STRIDE) };
 }
 
@@ -441,6 +438,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Hybrid kernel chunk size: env override of compile-time default.  Smaller
+    // = finer pipeline grain at higher per-chunk sync cost; larger = fewer
+    // chunks but worse cross-GPU phase overlap.
+    p->hybrid_chunk_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HYBRID_CHUNK_BYTES",
+                                                 GGML_CUDA_AR_HYBRID_CHUNK_BYTES);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -485,6 +487,18 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
                            __func__, p->devices[i]);
             ggml_cuda_ar_pipeline_free(p);
             return nullptr;
+        }
+
+        // Pre-record each slot's ev.ker on an idle stream so the first
+        // POOL_SIZE ARs can unconditionally cudaStreamWaitEvent on it without
+        // blocking forever waiting for an unrecorded event.
+        for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+            if (cudaEventRecord(p->ev_pool[i][s].ker, p->streams[i]) != cudaSuccess) {
+                GGML_LOG_ERROR("%s: cudaEventRecord (pre-fire) failed for device %d slot %d\n",
+                               __func__, p->devices[i], s);
+                ggml_cuda_ar_pipeline_free(p);
+                return nullptr;
+            }
         }
     }
 
@@ -798,6 +812,24 @@ bool ggml_cuda_ar_allreduce(
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
 
+    // One-shot diagnostic: log the path + sizing chosen for the FIRST AR call,
+    // so it's easy to verify which path is in use without rebuilding.  Subsequent
+    // calls don't log to keep stdout uncluttered.
+    if (!p->dispatch_logged) {
+        p->dispatch_logged = true;
+        const char * path = use_copy_engine ? "copy-engine" : "hybrid-kernel";
+        const size_t hybrid_chunk_max  = p->hybrid_chunk_bytes / type_size;
+        const size_t hybrid_n_chunks   = (ne + hybrid_chunk_max - 1) / hybrid_chunk_max;
+        fprintf(stderr,
+                "ggml_cuda_ar: first AR -- ne=%lld nbytes=%zu use_bf16=%d wire=%s "
+                "path=%s copy_threshold=%zu hybrid_chunk_bytes=%zu "
+                "(if hybrid: chunk_max=%zu n_chunks=%zu)\n",
+                (long long) ne, nbytes, (int) use_bf16,
+                ggml_type_name(kernel_type), path,
+                p->copy_threshold, p->hybrid_chunk_bytes,
+                hybrid_chunk_max, hybrid_n_chunks);
+    }
+
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
     // (chunked kernel path) and the combined add kernel (copy_engine path)
     // both accumulate into the F32 tensor data directly, so an inactive
@@ -901,13 +933,32 @@ bool ggml_cuda_ar_allreduce(
         // pipeline sync; n_chunks=1 is the small-AR fast path.  Runs entirely
         // on the caller's compute stream -- AR is a barrier here, so same-
         // stream ordering subsumes the cross-stream event handshake that the
-        // copy-engine path needs and avoids its scheduling overhead.  Only
-        // ev.ker is still recorded for acquire_slot's pool-wraparound check.
-        const int    chunk_max       = (int) (GGML_CUDA_AR_HYBRID_CHUNK_BYTES / type_size);
+        // copy-engine path needs and avoids its scheduling overhead.  ev.ker
+        // is recorded for two purposes: end-of-AR sync against subsequent
+        // compute work, and slot-reuse protection (cross-device wait below).
+        const int    chunk_max       = (int) (p->hybrid_chunk_bytes / type_size);
         const int    n_chunks        = (int) ((ne + chunk_max - 1) / chunk_max);
         const size_t input_type_size = ggml_type_size(input_type);
 
         const auto [slot, token] = ggml_cuda_ar_acquire_slot(p);
+
+        // Slot-reuse fence: peer's prior AR for this slot must finish reading
+        // our host_buf[i][slot] before we launch the new AR that overwrites
+        // it.  Pre-recorded at init so the first POOL_SIZE ARs see an already-
+        // fired event (no actual wait).  Stream-side wait, not host-blocking.
+        //
+        // BOTH waits must happen BEFORE any of the new AR's kernels record
+        // their ev.ker.  If we interleaved wait/launch/record per device, the
+        // second device's wait would see the FIRST device's just-recorded
+        // event (the in-flight new AR) instead of the prior occupant -- a
+        // circular dependency with the in-kernel peer signal -> deadlock.
+        for (int i = 0; i < n; ++i) {
+            const int peer = 1 - i;
+            auto * cuda_ctx = static_cast<ggml_backend_cuda_context *>(backends[i]->context);
+            GGML_ASSERT(cuda_ctx->device == p->devices[i]);
+            ggml_cuda_set_device(p->devices[i]);
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), p->ev_pool[peer][slot].ker, 0));
+        }
 
         for (int i = 0; i < n; ++i) {
             const int peer = 1 - i;  // valid for n == 2 only
