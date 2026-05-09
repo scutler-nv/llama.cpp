@@ -238,13 +238,13 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // from AR N-2 by the time we get to AR N.  acquire_slot's
 // cudaEventSynchronize on ev.ker for both devices makes that consumption
 // explicit before we overwrite host_buf[slot] for the new AR.
-static constexpr int GGML_CUDA_AR_POOL_SIZE = 8;
+static constexpr int GGML_CUDA_AR_POOL_SIZE = 4;
 
 // Maximum AR wire size (bytes per GPU) handled by the chunked kernel /
 // hybrid kernel path.  host_buf is sized to this per pool slot, so it must
 // also accommodate the full hybrid AR (which doesn't reuse buffer slots
 // across chunks within an AR -- that's what enables cross-GPU phase overlap).
-static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 4 * 1024 * 1024; // 4 MB
+static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 16 * 1024 * 1024; // 16 MB
 
 // Hybrid kernel chunk size (BF16 wire bytes).  Smaller = finer-grain pipeline
 // across GPUs but more sync overhead per AR.  Compile-time so we can shmoo it.
@@ -264,7 +264,7 @@ static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
 // AR wire size at which the copy-engine path takes over from the kernel
 // path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
-static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 4 * 1024 * 1024; // 4 MB
+static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 16 * 1024 * 1024; // 16 MB
 // Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
 // The /4 keeps ~4 chunks in flight at any moment (good D2H/H2D overlap with
 // the peer); the clamps cover the cases where nbytes/4 is too small (per-
