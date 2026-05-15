@@ -20,13 +20,13 @@
 //
 // Two reduction strategies are selected per call by tensor size:
 //
-//   * Chunked-kernel path (small reductions): a single CUDA kernel both
+//   * Chunked kernel path (small reductions): a single CUDA kernel both
 //     stages data through pinned host memory and performs the local sum.
 //     Cross-GPU synchronization happens *inside the kernel* (busy-wait on
 //     a host-memory flag), which keeps launch overhead low for the
 //     latency-sensitive token-generation case.
 //
-//   * Copy-engine path (large reductions): the transfer is split into
+//   * Copyengine path (large reductions): the transfer is split into
 //     D2H + H2D cudaMemcpyAsync chunks driven by the GPU's copy engine,
 //     followed by a small device-side add kernel.  Cross-GPU
 //     synchronization happens *outside the kernel*, via CUDA events between
@@ -77,7 +77,7 @@ static constexpr size_t GGML_CUDA_AR_ARRIVAL_STRIDE = 64;
 static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 
 // ---------------------------------------------------------------------------
-// Chunked-kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
+// Chunked kernel AllReduce -- 2 GPUs, supports float, half, and bfloat16.
 //
 // Both GPUs run this kernel simultaneously on independent streams.  sendbuf
 // and recvbuf live in T_dst (the caller's tensor type); host_mine / host_other
@@ -90,17 +90,17 @@ static constexpr int GGML_CUDA_AR_KERNEL_BLOCKS = 8;
 // threads to keep multiple SMs issuing PCIe stores in parallel.  For each
 // chunk c, both GPUs run:
 //
-//   D2H[c]  threadfence_system  signal(token+c)        (Phase 1)
-//   wait_peer(token+c)  threadfence_system  H2D[c]+sum (Phase 3)
+//   Phase 1:  D2H[c]  threadfence_system  signal(token+c)
+//   Phase 2:  wait_peer(token+c)  threadfence_system  H2D[c]+sum
 //
-// Phase 1 first issues all D2Hs and signals all per-chunk tokens; phase 3
-// then waits on each token before its matching H2D.  Each H2D waits only
-// for its own chunk to be ready on the peer rather than for peer's entire
-// D2H phase, so when the two GPUs drift out of phase one GPU's H2D can
-// overlap with the other's still-in-progress D2H (different PCIe directions
-// on different links).  Buffer is not reused across chunks -- host_mine /
-// host_other are sized to the full AR -- so peer can read chunk c at any
-// time after we've signalled.
+// Phase 1 issues all D2Hs and signals each per-chunk token as soon as that
+// chunk's writes are visible; phase 2 then waits on each token before its
+// matching H2D.  Each H2D waits only for its own chunk to be ready on the
+// peer rather than for peer's entire D2H phase, so when the two GPUs drift
+// out of phase one GPU's H2D can overlap with the other's still-in-progress
+// D2H (different PCIe directions on different links).  Buffer is not reused
+// across chunks -- host_mine / host_other are sized to the full AR -- so
+// peer can read chunk c at any time after we've signalled.
 //
 // Each block has its own arrival-token slot (offset by bid * ARRIVAL_STRIDE);
 // thread 0 of each block signals/spins on that slot independently of other
@@ -138,7 +138,7 @@ static __global__ void ggml_cuda_ar_kernel(
     int       * my_slot    = arrival_mine  + bid * ARRIVAL_INTS;
     const int * other_slot = arrival_other + bid * ARRIVAL_INTS;
 
-    // Phase 1: chunked D2H.  After each chunk's writes, fence + signal the
+    // Phase 1: per-chunk D2H.  After each chunk's writes, fence + signal the
     // matching token so peer can begin reading that chunk.
     for (int c = 0; c < n_chunks; ++c) {
         const int chunk_offset = c * chunk_max;
@@ -174,7 +174,7 @@ static __global__ void ggml_cuda_ar_kernel(
         __syncthreads();
     }
 
-    // Phase 3: per-chunk pre-spin then H2D + reduce.
+    // Phase 2: per-chunk pre-spin then H2D + reduce.
     for (int c = 0; c < n_chunks; ++c) {
         if (tid == 0) {
             const int target = token + c;
@@ -242,37 +242,37 @@ static __global__ void ggml_cuda_ar_add_kernel(
 // Pipeline structure
 // ---------------------------------------------------------------------------
 
-// Number of slots in the event / arrival ring.  Two slots is sufficient:
-// lockstep guarantees the two GPUs are at most one AR (or chunk) apart, so
-// slot[N%2] is always safe to reuse -- peer has already consumed slot[N%2]
-// from AR N-2 by the time we get to AR N.  acquire_slot's
-// cudaEventSynchronize on ev.ker for both devices makes that consumption
-// explicit before we overwrite host_buf[slot] for the new AR.
+// Number of slots in the event / arrival / host_buf ring used by the kernel
+// path.  Each AR call grabs slot = call_count % POOL_SIZE; reusing a slot is
+// guaranteed safe by a cross-device cudaStreamWaitEvent on the peer's prior
+// ev.ker for that slot, issued at AR launch time (see copy_impl).  Four
+// slots is the sweet spot in practice: enough to keep small ARs pipelined
+// without holding too much pinned memory.
 static constexpr int GGML_CUDA_AR_POOL_SIZE = 4;
 
-// Maximum AR wire size (bytes per GPU) handled by the chunked kernel /
-// hybrid kernel path.  host_buf is sized to this per pool slot, so it must
-// also accommodate the full hybrid AR (which doesn't reuse buffer slots
-// across chunks within an AR -- that's what enables cross-GPU phase overlap).
+// Maximum AR wire size (bytes per GPU) handled by the chunked kernel path.
+// host_buf is sized to this per pool slot, so it must accommodate the full
+// AR -- the kernel does not reuse buffer slots across chunks within a call
+// (that's what enables cross-GPU per-chunk overlap).
 static constexpr size_t GGML_CUDA_AR_MAX_BYTES = 16 * 1024 * 1024; // 16 MB
 
-// Hybrid kernel chunk size (BF16 wire bytes).  Smaller = finer-grain pipeline
-// across GPUs but more sync overhead per AR.  Compile-time so we can shmoo it.
+// Per-chunk size inside the kernel (BF16 wire bytes).  Smaller = finer-grain
+// cross-GPU pipeline but more sync overhead per AR.  Compile-time so we can
+// shmoo it.
 #ifndef GGML_CUDA_AR_HYBRID_CHUNK_BYTES
 #define GGML_CUDA_AR_HYBRID_CHUNK_BYTES (512 * 1024) // 512 KB
 #endif // GGML_CUDA_AR_HYBRID_CHUNK_BYTES
 
 // Per-AR token stride.  Each AR reserves this many consecutive token values:
-// one per inner sync (post-D2H of each chunk) for the hybrid kernel.  256
-// leaves room for up to 256 chunks per AR -- plenty for any chunk size we'd
-// realistically shmoo.
+// one per inner sync (post-D2H of each chunk).  256 leaves room for up to
+// 256 chunks per AR -- plenty for any chunk size we'd realistically shmoo.
 static constexpr int GGML_CUDA_AR_TOKEN_STRIDE = 256;
 
-// Copy-engine path: largest tensor accepted on this path; sets host_large /
+// Copyengine path: largest tensor accepted on this path; sets host_large /
 // dev_tmp allocation size.
 static constexpr size_t GGML_CUDA_AR_COPY_MAX_BYTES = 32 * 1024 * 1024; // 32 MB
 
-// AR wire size at which the copy-engine path takes over from the kernel
+// AR wire size at which the copyengine path takes over from the kernel
 // path.  Override via GGML_CUDA_AR_COPY_THRESHOLD.
 static constexpr size_t GGML_CUDA_AR_COPY_THRESHOLD_DEFAULT = 16 * 1024 * 1024; // 16 MB
 // Per-call CE chunk-size heuristic: chunk_bytes = clamp(nbytes / 4, MIN, MAX).
@@ -340,18 +340,18 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_threshold;
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
-    size_t   hybrid_chunk_bytes; // hybrid kernel chunk size; runtime override of compile-time GGML_CUDA_AR_HYBRID_CHUNK_BYTES
+    size_t   hybrid_chunk_bytes; // per-chunk size inside the kernel; runtime override of compile-time GGML_CUDA_AR_HYBRID_CHUNK_BYTES
     uint64_t call_count;
     bool     dispatch_logged;    // one-shot: print chosen path + params at first AR
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
-    ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
-    char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
-    cudaStream_t              streams[GGML_CUDA_MAX_DEVICES];    // per-device AR stream (copy-engine path)
+    ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copyengine)
+    char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copyengine path
+    cudaStream_t              streams[GGML_CUDA_MAX_DEVICES];    // per-device AR stream (copyengine path)
     ggml_cuda_ar_event_slot   ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
 
-    // Copy-engine path: per-(GPU, slot) write/read events.  Reused across
+    // Copyengine path: per-(GPU, slot) write/read events.  Reused across
     // waves WITHIN one AR (cross-GPU per-chunk fence) and across ARs
     // (host_large slot-reuse fence -- peer must finish reading our
     // host_large[s] before we overwrite it on the next AR / next wave).
@@ -391,16 +391,16 @@ struct ggml_cuda_ar_slot_info {
 };
 
 static ggml_cuda_ar_slot_info ggml_cuda_ar_acquire_slot(ggml_cuda_ar_pipeline * p) {
+    // The cross-device slot-reuse fence is issued at the AR launch site as
+    // a cudaStreamWaitEvent on the peer's prior ev.ker for this slot --
+    // non-host-blocking, so the host can keep queuing work while the GPU
+    // waits.
     const int slot = static_cast<int>(p->call_count % GGML_CUDA_AR_POOL_SIZE);
     p->call_count++;
-    // Slot-reuse fence is no longer here.  Each AR launch site issues a
-    // cross-device cudaStreamWaitEvent on the peer's prior ev.ker for this
-    // slot before the new AR kernel starts -- non-host-blocking, so the host
-    // can keep queuing work while the GPU waits (if it even needs to).
     return { slot, (int) (p->call_count * GGML_CUDA_AR_TOKEN_STRIDE) };
 }
 
-// Per-AR copy-engine chunk size: env-var override if set, else heuristic
+// Per-AR copyengine chunk size: env-var override if set, else heuristic
 // (clamp(nbytes/4, HEURISTIC_MIN, HEURISTIC_MAX)).
 static size_t ggml_cuda_ar_chunk_bytes(const ggml_cuda_ar_pipeline * p, size_t nbytes) {
     if (p->copy_chunk_bytes > 0) {
@@ -456,9 +456,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
-    // Hybrid kernel chunk size: env override of compile-time default.  Smaller
-    // = finer pipeline grain at higher per-chunk sync cost; larger = fewer
-    // chunks but worse cross-GPU phase overlap.
+    // Per-chunk size inside the kernel: env override of compile-time default.
+    // Smaller = finer pipeline grain at higher per-chunk sync cost; larger =
+    // fewer chunks but worse cross-GPU phase overlap.
     p->hybrid_chunk_bytes = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HYBRID_CHUNK_BYTES",
                                                  GGML_CUDA_AR_HYBRID_CHUNK_BYTES);
     for (size_t i = 0; i < n_devices; ++i) {
@@ -466,7 +466,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     // Per-device streams and event pools.  One AR stream per device on the
-    // copy-engine path: stream-sequential ordering serializes ARs and gives
+    // copyengine path: stream-sequential ordering serializes ARs and gives
     // wave-to-wave dev_tmp slot reuse for free, leaving only the cross-GPU
     // per-chunk events (write_ev / read_ev) as explicit synchronization.
     for (size_t i = 0; i < n_devices; ++i) {
@@ -550,7 +550,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
-    // Copy-engine path: pinned host staging + device scratch, both sliced into
+    // Copyengine path: pinned host staging + device scratch, both sliced into
     // a ring of N_SLOTS = (copy_bytes / chunk_bytes) chunk-sized slots.  Slot
     // reuse within an AR is per-chunk (host_large) and per-wave (dev_tmp);
     // cross-AR sync rides on the slot pool's ev.ker as before.
@@ -571,7 +571,7 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     }
 
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
+                  "%zu KB chunked kernel staging + %zu MB copyengine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
 
     return p;
@@ -815,7 +815,7 @@ bool ggml_cuda_ar_allreduce(
     const size_t   input_nbytes = ggml_nbytes(tensors[0]);
 
     // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
-    // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
+    // the reduction (chunked or copyengine), halving on-wire bytes. Matches
     // NCCL's behaviour. The pre-conversion zeroes inactive shards so the
     // inner paths see them as already-prepared compute tensors.
     const bool use_bf16 =
@@ -833,11 +833,11 @@ bool ggml_cuda_ar_allreduce(
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // Path selection: kernel for AR <= copy_threshold, copy-engine above.  The
-    // kernel itself further splits into n_chunks of HYBRID_CHUNK_BYTES with
-    // per-chunk D2H/H2D pipeline sync -- single-chunk and multi-chunk are the
-    // same code path.  Copy-engine handles arbitrary AR sizes via per-chunk
-    // ring-buffer reuse of host_large and per-wave reuse of dev_tmp.
+    // Path selection: kernel for AR <= copy_threshold, copyengine above.
+    // The kernel splits the AR into n_chunks of HYBRID_CHUNK_BYTES with
+    // per-chunk D2H/H2D pipeline sync.  Copyengine handles arbitrary AR
+    // sizes via per-chunk ring-buffer reuse of host_large and per-wave reuse
+    // of dev_tmp.
     const bool use_copy_engine =
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
@@ -847,17 +847,17 @@ bool ggml_cuda_ar_allreduce(
     // calls don't log to keep stdout uncluttered.
     if (!p->dispatch_logged) {
         p->dispatch_logged = true;
-        const char * path = use_copy_engine ? "copy-engine" : "hybrid-kernel";
-        const size_t hybrid_chunk_max  = p->hybrid_chunk_bytes / type_size;
-        const size_t hybrid_n_chunks   = (ne + hybrid_chunk_max - 1) / hybrid_chunk_max;
+        const char * path = use_copy_engine ? "copyengine" : "chunked kernel";
+        const size_t kernel_chunk_max  = p->hybrid_chunk_bytes / type_size;
+        const size_t kernel_n_chunks   = (ne + kernel_chunk_max - 1) / kernel_chunk_max;
         fprintf(stderr,
                 "ggml_cuda_ar: first AR -- ne=%lld nbytes=%zu use_bf16=%d wire=%s "
                 "path=%s copy_threshold=%zu hybrid_chunk_bytes=%zu "
-                "(if hybrid: chunk_max=%zu n_chunks=%zu)\n",
+                "(if kernel: chunk_max=%zu n_chunks=%zu)\n",
                 (long long) ne, nbytes, (int) use_bf16,
                 ggml_type_name(kernel_type), path,
                 p->copy_threshold, p->hybrid_chunk_bytes,
-                hybrid_chunk_max, hybrid_n_chunks);
+                kernel_chunk_max, kernel_n_chunks);
     }
 
     // BF16 inactive-shard zeroing: when use_bf16 is on, the combined kernel
@@ -963,7 +963,7 @@ bool ggml_cuda_ar_allreduce(
         // pipeline sync; n_chunks=1 is the small-AR fast path.  Runs entirely
         // on the caller's compute stream -- AR is a barrier here, so same-
         // stream ordering subsumes the cross-stream event handshake that the
-        // copy-engine path needs and avoids its scheduling overhead.  ev.ker
+        // copyengine path needs and avoids its scheduling overhead.  ev.ker
         // is recorded for two purposes: end-of-AR sync against subsequent
         // compute work, and slot-reuse protection (cross-device wait below).
         const int    chunk_max       = (int) (p->hybrid_chunk_bytes / type_size);
