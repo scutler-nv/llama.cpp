@@ -343,6 +343,7 @@ struct ggml_cuda_ar_pipeline {
     size_t   hybrid_chunk_bytes; // per-chunk size inside the kernel; runtime override of compile-time GGML_CUDA_AR_HYBRID_CHUNK_BYTES
     uint64_t call_count;
     bool     dispatch_logged;    // one-shot: print chosen path + params at first AR
+    bool     copy_required_warned;
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -833,14 +834,24 @@ bool ggml_cuda_ar_allreduce(
         compute_flag[i] = (tensors[i]->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
     }
 
-    // Path selection: kernel for AR <= copy_threshold, copyengine above.
-    // The kernel splits the AR into n_chunks of HYBRID_CHUNK_BYTES with
-    // per-chunk D2H/H2D pipeline sync.  Copyengine handles arbitrary AR
-    // sizes via per-chunk ring-buffer reuse of host_large and per-wave reuse
-    // of dev_tmp.
-    const bool use_copy_engine =
+    // Path selection: copy_threshold controls the tuning boundary, but the
+    // copy engine path is mandatory once the AR no longer fits in one
+    // chunked kernel staging slot.  The kernel splits the AR into n_chunks of
+    // HYBRID_CHUNK_BYTES with per-chunk D2H/H2D pipeline sync.  Copyengine
+    // handles arbitrary AR sizes via per-chunk ring-buffer reuse of
+    // host_large and per-wave reuse of dev_tmp.
+    const bool copy_selected_by_threshold =
         p->copy_threshold > 0 &&
         nbytes >= p->copy_threshold;
+    const bool copy_required_for_size = nbytes > p->buf_bytes;
+    const bool use_copy_engine = copy_selected_by_threshold || copy_required_for_size;
+
+    if (copy_required_for_size && !copy_selected_by_threshold && !p->copy_required_warned) {
+        p->copy_required_warned = true;
+        GGML_LOG_WARN("%s: internal AllReduce tensor (%zu bytes) exceeds chunked kernel staging "
+                      "(%zu bytes); forcing copy engine path despite GGML_CUDA_AR_COPY_THRESHOLD=%zu\n",
+                      __func__, nbytes, p->buf_bytes, p->copy_threshold);
+    }
 
     // One-shot diagnostic: log the path + sizing chosen for the FIRST AR call,
     // so it's easy to verify which path is in use without rebuilding.  Subsequent
