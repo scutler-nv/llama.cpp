@@ -211,6 +211,17 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Same as above, but for the case where each rank lives in a separate process (possibly on a different host),
+    //     so a single process only ever owns one backend of the communicator. Used by the RPC backend.
+    // The unique id is produced by one rank and must be distributed to all other ranks out-of-band before they
+    //     can call comm_init_rank; comm_init_rank blocks until every rank of the communicator has joined.
+    // The resulting context is released with ggml_backend_comm_free_t.
+#define GGML_BACKEND_COMM_UNIQUE_ID_SIZE 128
+    // A null output queries support without creating an id.
+    typedef bool   (*ggml_backend_comm_get_unique_id_t)(void * id_out);
+    typedef void * (*ggml_backend_comm_init_rank_t)(ggml_backend_t backend, const void * id, int rank, int world_size);
+    typedef bool   (*ggml_backend_comm_allreduce_rank_t)(void * comm_ctx, struct ggml_tensor * tensor);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend

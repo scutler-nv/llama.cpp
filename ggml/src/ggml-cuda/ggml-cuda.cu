@@ -1026,6 +1026,11 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    // Only set for communicators created with comm_init_rank, where the other ranks live in different
+    //     processes and this context therefore owns exactly one backend / one communicator.
+    int                         rank       = -1;
+    int                         world_size = 0;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
@@ -1301,6 +1306,173 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
     return comm_ctx->try_allreduce(comm_ctx, tensors);
+}
+
+// ---------------------------------------------------------------------------
+// Multi-process AllReduce.
+//
+// The functions above assume that all ranks of the communicator live in this
+// process, which is what ncclCommInitAll provides.  For multi-node tensor
+// parallelism each rank is a separate process, so the communicator has to be
+// built with ncclCommInitRank instead: one rank generates a unique id, that id
+// is distributed out-of-band (over the RPC connection), and every rank then
+// joins with its own index.
+// ---------------------------------------------------------------------------
+
+static bool ggml_backend_cuda_comm_get_unique_id(void * id_out) {
+#ifdef GGML_USE_NCCL
+    if (id_out == nullptr) {
+        return true;
+    }
+    static_assert(sizeof(ncclUniqueId) <= GGML_BACKEND_COMM_UNIQUE_ID_SIZE,
+                  "ncclUniqueId does not fit into GGML_BACKEND_COMM_UNIQUE_ID_SIZE");
+
+    ncclUniqueId id;
+    const ncclResult_t rc = ncclGetUniqueId(&id);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("%s: ncclGetUniqueId failed (%s)\n", __func__, ncclGetErrorString(rc));
+        return false;
+    }
+
+    memset(id_out, 0, GGML_BACKEND_COMM_UNIQUE_ID_SIZE);
+    memcpy(id_out, &id, sizeof(id));
+    return true;
+#else // GGML_USE_NCCL
+    GGML_LOG_ERROR("%s: NCCL not compiled in, recompile with -DGGML_CUDA_NCCL=ON\n", __func__);
+    GGML_UNUSED(id_out);
+    return false;
+#endif // GGML_USE_NCCL
+}
+
+// Blocks until all world_size ranks have joined.
+static void * ggml_backend_cuda_comm_init_rank(ggml_backend_t backend, const void * id_in, int rank, int world_size) {
+#ifdef GGML_USE_NCCL
+    if (!ggml_backend_is_cuda(backend)) {
+        GGML_LOG_ERROR("%s: backend is not a CUDA backend\n", __func__);
+        return nullptr;
+    }
+    if (world_size < 1 || rank < 0 || rank >= world_size) {
+        GGML_LOG_ERROR("%s: invalid rank %d for world size %d\n", __func__, rank, world_size);
+        return nullptr;
+    }
+
+    // NCCL requires one distinct physical GPU per rank, see ggml_backend_cuda_comm_init_nccl.
+    const ggml_cuda_device_info & info = ggml_cuda_info();
+    if (info.device_count > info.physical_device_count) {
+        GGML_LOG_ERROR("%s: CUDA virtual devices are in use, which NCCL does not support\n", __func__);
+        return nullptr;
+    }
+
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    auto * ret = new ggml_backend_cuda_comm_context;
+    ret->backends.push_back(backend);
+    ret->dev_ids.push_back(cuda_ctx->device);
+    ret->rank       = rank;
+    ret->world_size = world_size;
+    ret->comms.resize(1);
+
+    ncclUniqueId id;
+    memcpy(&id, id_in, sizeof(id));
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    const ncclResult_t rc = ncclCommInitRank(&ret->comms[0], world_size, id, rank);
+    if (rc != ncclSuccess) {
+        GGML_LOG_ERROR("%s: ncclCommInitRank failed for rank %d/%d (%s)\n",
+                       __func__, rank, world_size, ncclGetErrorString(rc));
+        ret->comms.clear();
+        delete ret;
+        return nullptr;
+    }
+
+    GGML_LOG_INFO("%s: joined NCCL communicator as rank %d/%d on device %d\n",
+                  __func__, rank, world_size, cuda_ctx->device);
+    return ret;
+#else // GGML_USE_NCCL
+    GGML_LOG_ERROR("%s: NCCL not compiled in, recompile with -DGGML_CUDA_NCCL=ON\n", __func__);
+    GGML_UNUSED(backend);
+    GGML_UNUSED(id_in);
+    GGML_UNUSED(rank);
+    GGML_UNUSED(world_size);
+    return nullptr;
+#endif // GGML_USE_NCCL
+}
+
+// Single-rank counterpart of ggml_backend_cuda_comm_allreduce_nccl: reduces this rank's contribution
+//     in-place, using the same FP32/BF16 heuristic. Returns false if the tensor cannot be handled,
+//     in which case the caller is responsible for falling back.
+static bool ggml_backend_cuda_comm_allreduce_rank(void * comm_ctx_v, struct ggml_tensor * tensor) {
+#ifdef GGML_USE_NCCL
+    if (comm_ctx_v == nullptr || tensor == nullptr) {
+        return false;
+    }
+
+    auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
+    if (comm_ctx->world_size < 1 || comm_ctx->comms.size() != 1) {
+        GGML_LOG_ERROR("%s: communicator was not created by comm_init_rank\n", __func__);
+        return false;
+    }
+
+    // Only F32 is reduced, matching ggml_backend_cuda_comm_allreduce_nccl.
+    if (tensor->type != GGML_TYPE_F32) {
+        GGML_LOG_DEBUG("%s: unsupported type %s\n", __func__, ggml_type_name(tensor->type));
+        return false;
+    }
+    if (!ggml_is_contiguously_allocated(tensor)) {
+        GGML_LOG_DEBUG("%s: tensor %s is not contiguously allocated\n", __func__, tensor->name);
+        return false;
+    }
+
+    const int64_t ne = ggml_nelements(tensor);
+    if (ne == 0) {
+        return true;
+    }
+
+    const size_t     n_ranks  = (size_t) comm_ctx->world_size;
+    ncclComm_t       comm     = comm_ctx->comms[0];
+    auto *           cuda_ctx = (ggml_backend_cuda_context *) comm_ctx->backends[0]->context;
+    const cudaStream_t stream = cuda_ctx->stream();
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    // Shards that were disabled (zero-sized slice) must contribute zero rather than whatever
+    //     happens to be in the buffer.
+    const bool active = (tensor->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+
+    // For small tensors, simply reduce them as FP32.
+    if ((n_ranks <= 2 && ne < 32768) || (n_ranks == 3 && ne < 131072) || (n_ranks >= 4 && ne < 262144)) {
+        if (!active) {
+            CUDA_CHECK(cudaMemsetAsync(tensor->data, 0, ggml_nbytes(tensor), stream));
+        }
+        NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, ne, ncclFloat, ncclSum, comm, stream));
+        return true;
+    }
+
+    // Preserve the large-tensor input precision used by the pairwise RPC path.
+    to_bf16_cuda_t to_bf16 = ggml_get_to_bf16_cuda(GGML_TYPE_F32);
+    to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(GGML_TYPE_BF16);
+
+    ggml_cuda_pool_alloc<nv_bfloat16> tmp(cuda_ctx->pool());
+    tmp.alloc(ne);
+
+    if (active) {
+        to_bf16(tensor->data, tmp.get(), ne, stream);
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(tmp.get(), 0, ne * sizeof(nv_bfloat16), stream));
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    // Match the pairwise RPC path: round each input to BF16, then sum in FP32.
+    to_fp32(tmp.get(), (float *) tensor->data, ne, stream);
+    CUDA_CHECK(cudaGetLastError());
+    NCCL_CHECK(ncclAllReduce(tensor->data, tensor->data, ne, ncclFloat, ncclSum, comm, stream));
+
+    return true;
+#else // GGML_USE_NCCL
+    GGML_UNUSED(comm_ctx_v);
+    GGML_UNUSED(tensor);
+    return false;
+#endif // GGML_USE_NCCL
 }
 
 // host buffer type
@@ -6292,6 +6464,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
+    }
+    if (strcmp(name, "ggml_backend_comm_get_unique_id") == 0) {
+        return (void *)ggml_backend_cuda_comm_get_unique_id;
+    }
+    if (strcmp(name, "ggml_backend_comm_init_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_init_rank;
+    }
+    if (strcmp(name, "ggml_backend_comm_allreduce_rank") == 0) {
+        return (void *)ggml_backend_cuda_comm_allreduce_rank;
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
