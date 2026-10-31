@@ -2,6 +2,7 @@
 #include "common.h"
 
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -46,6 +47,10 @@ int main(int argc, char *argv[] ) {
         auto add_server = (ggml_backend_reg_t (*)(const char *)) ggml_backend_reg_get_proc_address(rpc, "ggml_backend_rpc_add_server");
         GGML_ASSERT(add_server != nullptr);
         for (int i = 2; i < argc; i++) {
+            if (strcmp(argv[i], "--tensor") == 0) {
+                params.split_mode = LLAMA_SPLIT_MODE_TENSOR;
+                continue;
+            }
             auto * reg = add_server(argv[i]);
             GGML_ASSERT(reg != nullptr);
             for (size_t j = 0; j < ggml_backend_reg_dev_count(reg); j++) {

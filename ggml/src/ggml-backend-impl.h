@@ -105,6 +105,9 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    GGML_API size_t                     ggml_backend_meta_buft_n_bufts    (ggml_backend_buffer_type_t meta_buft);
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backend_buffer_type_t meta_buft, size_t index);
+
     //
     // Backend (stream)
     //

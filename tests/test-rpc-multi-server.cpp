@@ -1,11 +1,89 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-backend-impl.h"
+#include "ggml-cpp.h"
 #include "ggml-impl.h"
 #include "ggml-rpc.h"
 #include "ggml.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <vector>
+
+static ggml_backend_meta_split_state test_split(const ggml_tensor *, void * data) {
+    return *(ggml_backend_meta_split_state *) data;
+}
+
+static void test_meta_uploads(ggml_backend_t a, ggml_backend_t b) {
+    ggml_backend_dev_t devices[] = {ggml_backend_get_device(a), ggml_backend_get_device(b)};
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_Q4_K}) {
+        for (int axis : {0, 1, 2, int(GGML_BACKEND_SPLIT_AXIS_MIRRORED)}) {
+            for (int layout = 0; layout < 3; layout++) {
+                if (layout == 2 && axis > 1) {
+                    continue;
+                }
+                ggml_context_ptr ctx(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+                auto * tensor = ggml_new_tensor_3d(ctx.get(), type, 2048, 16, layout == 2 && axis == 0 ? 1 : 8);
+                ggml_backend_meta_split_state split = {};
+                split.axis = (ggml_backend_meta_split_axis) axis;
+                split.n_segments = 1;
+                split.nr[0] = 1;
+                if (axis < GGML_MAX_DIMS) {
+                    const int64_t n = tensor->ne[axis];
+                    split.ne[0] = layout == 1 ? 0 : n/4;
+                    split.ne[1] = n - split.ne[0];
+                    if (layout == 2) {
+                        split.n_segments = 2;
+                        split.nr[0] = 2;
+                        split.nr[1] = 1;
+                        split.ne[0] = split.ne[1] = split.ne[2] = n/8;
+                        split.ne[3] = 3*n/8;
+                    }
+                }
+                auto * dev = ggml_backend_meta_device(devices, 2, test_split, &split);
+                ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+                ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend.get()));
+                GGML_ASSERT(buffer);
+                ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                std::vector<uint8_t> expected(ggml_nbytes(tensor)), output(expected.size());
+                for (size_t i = 0; i < expected.size(); i++) {
+                    expected[i] = (17*i + 3) % 251;
+                }
+                ggml_backend_tensor_set(tensor, expected.data(), 0, expected.size());
+                ggml_backend_tensor_get(tensor, output.data(), 0, output.size());
+                GGML_ASSERT(output == expected);
+                for (auto & value : expected) {
+                    value ^= 0x5a;
+                }
+                std::array<ggml_backend_event_ptr, 2> events;
+                std::array<std::vector<uint8_t>, 2> staging;
+                for (auto & event : events) {
+                    event.reset(ggml_backend_event_new(dev));
+                    GGML_ASSERT(event);
+                    ggml_backend_event_record(event.get(), backend.get());
+                }
+                const size_t chunks[] = {13, 257, 65537, 65541};
+                size_t index = 0;
+                for (size_t offset = 0; offset < expected.size(); index++) {
+                    const size_t slot = index % events.size();
+                    ggml_backend_event_synchronize(events[slot].get());
+                    const size_t size = std::min(chunks[index % 4], expected.size() - offset);
+                    staging[slot].assign(expected.begin() + offset, expected.begin() + offset + size);
+                    ggml_backend_tensor_set_async(backend.get(), tensor, staging[slot].data(), offset, size);
+                    ggml_backend_event_record(events[slot].get(), backend.get());
+                    offset += size;
+                }
+                for (size_t i = 0; i < events.size(); i++) {
+                    ggml_backend_event_synchronize(events[i].get());
+                    std::fill(staging[i].begin(), staging[i].end(), 0);
+                }
+                ggml_backend_tensor_get(tensor, output.data(), 0, output.size());
+                GGML_ASSERT(output == expected);
+            }
+        }
+    }
+}
 
 static void test_uploads(ggml_backend_t backend) {
     ggml_init_params params = {ggml_tensor_overhead(), nullptr, true};
@@ -41,6 +119,29 @@ static void test_uploads(ggml_backend_t backend) {
     ggml_backend_event_free(event);
     ggml_backend_buffer_free(buffer);
     ggml_free(ctx);
+}
+
+static void test_strided_upload(ggml_backend_t backend) {
+    ggml_context_ptr ctx(ggml_init({2*ggml_tensor_overhead(), nullptr, true}));
+    auto * tensor = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 256);
+    auto * view = ggml_view_2d(ctx.get(), tensor, 8, 8, 16*sizeof(float), 5*sizeof(float));
+    ggml_backend_buffer_ptr buffer(ggml_backend_alloc_ctx_tensors(ctx.get(), backend));
+    GGML_ASSERT(buffer);
+    std::vector<float> input(88), output(256, 0.0f), expected(256, 0.0f);
+    ggml_backend_tensor_set(tensor, output.data(), 0, output.size()*sizeof(float));
+    for (size_t row = 0; row < 8; row++) {
+        for (size_t col = 0; col < 8; col++) {
+            input[row*11 + col] = expected[5 + row*16 + col] = float(1 + row*8 + col);
+        }
+    }
+    ggml_backend_event_ptr event(ggml_backend_event_new(ggml_backend_get_device(backend)));
+    GGML_ASSERT(event);
+    ggml_backend_tensor_set_2d_async(backend, view, input.data(), 0, 8*sizeof(float), 8, 16*sizeof(float), 11*sizeof(float));
+    ggml_backend_event_record(event.get(), backend);
+    ggml_backend_event_synchronize(event.get());
+    std::fill(input.begin(), input.end(), -1.0f);
+    ggml_backend_tensor_get(tensor, output.data(), 0, output.size()*sizeof(float));
+    GGML_ASSERT(output == expected);
 }
 
 int main(int argc, char ** argv) {
@@ -104,6 +205,9 @@ int main(int argc, char ** argv) {
     ggml_free(ctx);
     test_uploads(backend_a);
     test_uploads(backend_b);
+    test_strided_upload(backend_a);
+    test_strided_upload(backend_b);
+    test_meta_uploads(backend_a, backend_b);
     ggml_backend_free(backend_b);
     ggml_backend_free(backend_a);
     return 0;

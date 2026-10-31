@@ -1,6 +1,7 @@
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
+#include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1563,6 +1564,15 @@ bool llama_model_loader::can_stream(ggml_backend_buffer_type_t buft) const {
     if (files.empty() || no_alloc || check_tensors) {
         return false;
     }
+    if (ggml_backend_buft_is_meta(buft)) {
+        const size_t n = ggml_backend_meta_buft_n_bufts(buft);
+        for (size_t i = 0; i < n; i++) {
+            if (!can_stream(ggml_backend_meta_buft_simple_buft(buft, i))) {
+                return false;
+            }
+        }
+        return n > 0;
+    }
     auto * dev = ggml_backend_buft_get_device(buft);
     auto * reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (!reg) {
@@ -1605,8 +1615,9 @@ bool llama_model_loader::load_all_data(
         std::vector<ggml_backend_event_ptr> events;
 
         ~upload_state() {
-            for (auto & event : events) {
-                ggml_backend_event_synchronize(event.get());
+            // An upload can throw after queuing some slices but before recording its event.
+            if (backend) {
+                ggml_backend_synchronize(backend.get());
             }
         }
     } upload;

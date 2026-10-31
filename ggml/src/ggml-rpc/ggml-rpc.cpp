@@ -910,15 +910,21 @@ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggm
     ctx->dispatcher->send_data(header, data, size, false);
 }
 
-static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
-        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+static void ggml_backend_rpc_buffer_set_tensor_2d_impl(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data, bool async) {
+    if (size == 0 || n_copies == 0) {
+        return;
+    }
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
     LOG_DBG2("[%s] tensor: %s, offset: %zu, size: %s, n_copies: %zu, stride: %zu\n", __func__,
              rpc_log_format_tensor(tensor).c_str(), offset, rpc_log_format_size(size).c_str(), n_copies, stride_tensor);
     // input serialization format: | rpc_tensor | offset (8 bytes) | size (8 bytes) | n_copies (8 bytes) | stride (8 bytes) | data (size * n_copies bytes) |
-    size_t input_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t) + size*n_copies;
-    uint8_t * input = new uint8_t[input_size]();
+    const size_t header_size = sizeof(rpc_tensor) + 4*sizeof(uint64_t);
+    GGML_ASSERT(n_copies <= (SIZE_MAX - header_size) / size);
+    GGML_ASSERT(stride_data == 0 || n_copies - 1 <= (SIZE_MAX - size) / stride_data);
+    const size_t input_size = header_size + size*n_copies;
+    uint8_t * input = new uint8_t[input_size];
     uint8_t * dest = input;
     memcpy(dest, &rpc_tensor, sizeof(rpc_tensor));
     dest += sizeof(rpc_tensor);
@@ -929,7 +935,16 @@ static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, 
         memcpy(dest + i*size, (const char *)data + i*stride_data, size);
     }
     std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-    ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    if (async) {
+        ctx->dispatcher->send_async(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    } else {
+        ctx->dispatcher->send(RPC_CMD_SET_TENSOR_2D, input_ptr, input_size);
+    }
+}
+
+static void ggml_backend_rpc_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data,
+        size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    ggml_backend_rpc_buffer_set_tensor_2d_impl(buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data, false);
 }
 
 static void ggml_backend_rpc_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
@@ -1327,7 +1342,8 @@ static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_eve
 
 static void ggml_backend_rpc_set_tensor_2d_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
-    ggml_backend_tensor_set_2d(tensor, data, offset, size, n_copies, stride_tensor, stride_data);
+    auto * buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    ggml_backend_rpc_buffer_set_tensor_2d_impl(buffer, tensor, data, offset, size, n_copies, stride_tensor, stride_data, true);
     GGML_UNUSED(backend);
 }
 
