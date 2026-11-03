@@ -2389,7 +2389,8 @@ bool rpc_server::comm_allreduce(const rpc_msg_comm_allreduce_req & request) {
     if (wire_bf16) {
         t_wire_send = new_scratch_tensor(GGML_TYPE_BF16, 0);
         t_wire_recv = new_scratch_tensor(GGML_TYPE_BF16, ne*2);
-        compute_nodes(new_cpy_node(t_dst, t_wire_send), nullptr);
+        // Round both contributions to the wire precision so every rank gets the same sum.
+        compute_nodes(new_cpy_node(t_dst, t_wire_send), new_cpy_node(t_wire_send, t_dst));
         ggml_backend_synchronize(backend);
         ggml_backend_tensor_get(t_wire_send, state.send_buf.data(), 0, wire_bytes);
     } else {

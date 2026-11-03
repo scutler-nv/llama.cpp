@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 static ggml_backend_meta_split_state test_split(const ggml_tensor *, void * data) {
@@ -144,6 +145,64 @@ static void test_strided_upload(ggml_backend_t backend) {
     GGML_ASSERT(output == expected);
 }
 
+static void test_allreduce(ggml_backend_t a, ggml_backend_t b) {
+    auto * reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(a));
+    auto comm_init = (ggml_backend_comm_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_init");
+    auto comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_free");
+    auto allreduce = (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(
+            reg, "ggml_backend_comm_allreduce_tensor");
+    GGML_ASSERT(comm_init && comm_free && allreduce);
+    ggml_backend_t backends[] = {a, b};
+    void * comm = comm_init(backends, 2);
+    GGML_ASSERT(comm);
+
+    // Exercise both wire formats, including the BF16 threshold and scratch reuse.
+    for (int64_t count : {4096, 32767, 32768, 32769, 65536, 32768}) {
+        std::array<ggml_context_ptr, 2> contexts;
+        std::array<ggml_backend_buffer_ptr, 2> buffers;
+        ggml_tensor * tensors[2];
+        std::array<std::vector<float>, 2> values, output;
+        for (size_t rank = 0; rank < 2; rank++) {
+            contexts[rank].reset(ggml_init({ggml_tensor_overhead(), nullptr, true}));
+            tensors[rank] = ggml_new_tensor_1d(contexts[rank].get(), GGML_TYPE_F32, count);
+            tensors[rank]->flags |= GGML_TENSOR_FLAG_COMPUTE;
+            buffers[rank].reset(ggml_backend_alloc_ctx_tensors(contexts[rank].get(), backends[rank]));
+            GGML_ASSERT(buffers[rank]);
+            values[rank].resize(count);
+            output[rank].resize(count);
+        }
+        for (int iteration = 0; iteration < 2; iteration++) {
+            for (size_t rank = 0; rank < 2; rank++) {
+                for (int64_t i = 0; i < count; i++) {
+                    // These contributions are deliberately not exactly representable in BF16.
+                    values[rank][i] = rank == 0 ? 1.001f + float((i + iteration) % 97)*0.113f
+                                               : -0.9984f - float((3*i + iteration) % 89)*0.027f;
+                }
+                ggml_backend_tensor_set(tensors[rank], values[rank].data(), 0, count*sizeof(float));
+            }
+            GGML_ASSERT(allreduce(comm, tensors));
+            for (size_t rank = 0; rank < 2; rank++) {
+                ggml_backend_tensor_get(tensors[rank], output[rank].data(), 0, count*sizeof(float));
+            }
+            for (int64_t i = 0; i < count; i++) {
+                float lhs = values[0][i], rhs = values[1][i];
+                if (count >= 32768) {
+                    lhs = ggml_bf16_to_fp32(ggml_fp32_to_bf16(lhs));
+                    rhs = ggml_bf16_to_fp32(ggml_fp32_to_bf16(rhs));
+                }
+                const float expected = lhs + rhs;
+                if (output[0][i] != expected || output[1][i] != expected) {
+                    fprintf(stderr, "allreduce count=%lld index=%lld: ranks %g, %g; expected %g\n",
+                            (long long) count, (long long) i, output[0][i], output[1][i], expected);
+                    GGML_ABORT("RPC allreduce must produce the same sum on both ranks");
+                }
+            }
+        }
+        fprintf(stderr, "allreduce count=%lld: PASS\n", (long long) count);
+    }
+    comm_free(comm);
+}
+
 int main(int argc, char ** argv) {
     GGML_ASSERT(argc == 3);
     ggml_backend_load_all();
@@ -203,6 +262,7 @@ int main(int argc, char ** argv) {
     GGML_ASSERT(ggml_backend_buft_get_alloc_size(buft, strided) >= ggml_nbytes(strided));
 
     ggml_free(ctx);
+    test_allreduce(backend_a, backend_b);
     test_uploads(backend_a);
     test_uploads(backend_b);
     test_strided_upload(backend_a);
