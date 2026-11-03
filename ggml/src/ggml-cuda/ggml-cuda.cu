@@ -1,3 +1,4 @@
+#include "q8-reuse.cuh"
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -4935,6 +4936,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             } else {
                 stream_ctx.concurrent_events.clear();
             }
+
+            ggml_cuda_q8_reuse_scope q8_reuse(*cuda_ctx, cgraph, !should_launch_concurrent_events);
 
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
