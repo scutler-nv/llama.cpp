@@ -7,6 +7,7 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -236,7 +237,13 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
-    if (arch == LLM_ARCH_LLAMA4) {
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        n_vocab = 129; // exercise uneven vocabulary splits
+        n_embd  = 128;
+        n_head  = 4;
+        n_ff    = 192;
+        n_layer = 4; // three KDA layers followed by MLA
+    } else if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_MAION_CODER) {
         n_head = 4;
@@ -280,11 +287,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             || arch == LLM_ARCH_HY_V4) {
         n_embd = 128;
         n_head = 1;
-        n_ff   = 192;
-    } else if (arch == LLM_ARCH_GLM5_NEXT) {
-        // several heads so that -sm tensor can split them and the MLA flash attention has GQA > 1
-        n_embd = 128;
-        n_head = 16;
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
@@ -349,15 +351,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            n_head_per_layer.push_back(il == 1 ? 0 : n_head);
+            n_head_per_layer.push_back(arch == LLM_ARCH_GLM5_NEXT ? (il < 3 ? 0 : 1) : (il == 1 ? 0 : n_head));
         }
         // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
         if (arch == LLM_ARCH_GLM5_NEXT) {
             ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-            // the MLA cache holds one latent head
-            for (uint32_t & n : n_head_per_layer) {
-                n = std::min(n, uint32_t(1));
-            }
         } else {
             ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
         }
@@ -889,6 +887,57 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+static bool test_glm_attention_split(const llama_model * model) {
+    const auto & hp = model->hparams;
+    for (size_t n_devs : {1, 2, 3}) {
+        llama_meta_device_get_split_state_userdata ud = {n_devs, model};
+        for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+            const auto & layer = model->layers[il];
+            const int64_t head_dim = hp.is_recr(il) ? hp.n_embd_head_kda : hp.n_embd_head_v_mla();
+            const auto out = llama_meta_device_get_split_state(layer.wo, &ud);
+            auto check = [&](const ggml_tensor * tensor, int axis, int64_t units, uint32_t repeats = 1) {
+                const auto ss = llama_meta_device_get_split_state(tensor, &ud);
+                if (ss.axis != axis || ss.n_segments != 1 || ss.nr[0] != repeats) {
+                    return false;
+                }
+                for (size_t j = 0; j < n_devs; ++j) {
+                    if (out.ne[j] % head_dim || ss.ne[j] != out.ne[j]/head_dim * units) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            bool ok = out.axis == GGML_BACKEND_SPLIT_AXIS_0;
+            if (hp.is_recr(il)) {
+                ok &= check(layer.wq, 1, head_dim) && check(layer.wk, 1, head_dim) && check(layer.wv, 1, head_dim);
+                ok &= check(layer.ssm_q_conv, 2, head_dim) && check(layer.ssm_k_conv, 2, head_dim) && check(layer.ssm_v_conv, 2, head_dim);
+                ok &= check(layer.ssm_f_b, 1, head_dim) && check(layer.ssm_g_b, 1, head_dim);
+                ok &= check(layer.ssm_a, 0, 1) && check(layer.ssm_beta, 1, 1) && check(layer.ssm_dt_b, 0, head_dim);
+                ggml_tensor cache = {};
+                cache.type = GGML_TYPE_F32;
+                cache.ne[1] = cache.ne[2] = cache.ne[3] = 1;
+                cache.ne[0] = hp.n_embd_r();
+                ggml_format_name(&cache, "cache_r_l%u", il);
+                ok &= check(&cache, 0, head_dim * (hp.ssm_d_conv - 1), 3);
+                cache.ne[0] = hp.n_embd_s();
+                ggml_format_name(&cache, "cache_s_l%u", il);
+                ok &= check(&cache, 0, head_dim * head_dim);
+            } else {
+                ok &= check(layer.wq_b, 1, hp.n_embd_head_k_mla());
+                ok &= check(layer.wk_b, 2, 1) && check(layer.wv_b, 2, 1);
+                for (size_t j = 0; j < n_devs; ++j) {
+                    ok &= hp.n_lora_kv != 512 || out.ne[j]/head_dim != 1;
+                }
+            }
+            if (!ok) {
+                LOG_ERR("glm5-next: inconsistent attention split at layer %u on %zu devices\n", il, n_devs);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool moe_mandatory(const llm_arch arch) {
     switch (arch) {
         case LLM_ARCH_FLINT:
@@ -1263,6 +1312,9 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     if (logits_cpu.empty()) {
                         model_and_ctx_cpu = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, encode);
                         logits_cpu = get_logits(model_and_ctx_cpu.first.get(), model_and_ctx_cpu.second.get(), tokens, encode);
+                        if (arch == LLM_ARCH_GLM5_NEXT && !test_glm_attention_split(model_and_ctx_cpu.first.get())) {
+                            throw std::runtime_error("inconsistent GLM attention split");
+                        }
                     }
                     if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR || llama_arch_supports_sm_tensor(arch)) {
                         test_executed = true;
